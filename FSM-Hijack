@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Fahrschule Dynamic – Prüf-Center (Theorie, Praxis/Pflichtfahrten, Blitzsuche & GSheet-Notizen)
 // @namespace    https://portal.fahrschulmanager.de/
-// @version      5.8.1
+// @version      5.8.2
 // @description  Vollständige Theorie- & Pflichtfahrten-Analyse (inkl. Optionen-Menü mit Potsdam-Schalter & Dark Mode auf Hauptseite & Prüf-Center, Fahrschulwechsler ABN-Prüfung, B197, Sonderfahrten), Blitzsuche, Kartei & Google-Sheets-Notizen
 // @match        https://portal.fahrschulmanager.de/*
+// @updateURL    https://raw.githubusercontent.com/FlashBangZ-exe/Dynamic-Fahrschulmanager/main/FSM-Hijack.user.js
+// @downloadURL  https://raw.githubusercontent.com/FlashBangZ-exe/Dynamic-Fahrschulmanager/main/FSM-Hijack.user.js
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
