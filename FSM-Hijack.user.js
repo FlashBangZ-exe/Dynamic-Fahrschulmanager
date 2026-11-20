@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fahrschule Dynamic – Prüf-Center (Theorie, Praxis/Pflichtfahrten, Blitzsuche & GSheet-Notizen)
 // @namespace    https://portal.fahrschulmanager.de/
-// @version      5.8.2
+// @version      5.9.1
 // @description  Vollständige Theorie- & Pflichtfahrten-Analyse (inkl. Optionen-Menü mit Potsdam-Schalter & Dark Mode auf Hauptseite & Prüf-Center, Fahrschulwechsler ABN-Prüfung, B197, Sonderfahrten), Blitzsuche, Kartei & Google-Sheets-Notizen
 // @match        https://portal.fahrschulmanager.de/*
 // @updateURL    https://raw.githubusercontent.com/FlashBangZ-exe/Dynamic-Fahrschulmanager/main/FSM-Hijack.user.js
@@ -9,6 +9,10 @@
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_addValueChangeListener
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @connect      i.imgur.com
@@ -18,25 +22,105 @@
 (function () {
   'use strict';
 
+  // ============================================================================
+  // TEIL 1/5: KONSTANTEN, STORAGE, HILFSFUNKTIONEN, LOGO- & NOTIZEN-MANAGER
+  // ============================================================================
   const BASE_ORIGIN = 'https://portal.fahrschulmanager.de';
   const CUSTOM_LOGO_URL = 'https://i.imgur.com/Y17StTb.png';
   const CUSTOM_LOGO_CACHE_KEY = 'fsm_dyn_custom_logo_dataurl';
+  const CUSTOM_LOGO_SRC_KEY = 'fsm_dyn_custom_logo_src';
   const API_HEADERS = { 'Accept': 'application/json', 'X-CSRF': '1' };
   const pageWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  // Optional: Hier kannst du deine Google Apps Script Web-App URL ("https://script.google.com/macros/s/.../exec")
-  // fest eintragen – oder später einfach im Kartei-Fenster bei Punkt 5 auf "⚙️ Sheet-URL" klicken!
+  // Optional: Google Apps Script Web-App URL ("https://script.google.com/macros/s/.../exec")
   const DEFAULT_GSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxipfwTClq-xrxSjxzs5sTiYaH--syRgB0jo9_Uo78utq_CzOHOTFHDlAYqi6XnO7rmGg/exec';
 
   let controlCenterActive = false;
+  let portalObserver = null;
+  let appCleanupController = null;
+  let appStoreListener = null;
+  let appNotesListener = null;
+
+  const DynStorage = (() => {
+    const nativeLS = window.localStorage;
+    const hasGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+
+    // Einmalige Migration alter fsm_*-Einträge aus localStorage -> Tampermonkey-Speicher
+    if (hasGM && nativeLS) {
+      try {
+        const keysToMigrate = [];
+        for (let i = 0; i < nativeLS.length; i++) {
+          const k = nativeLS.key(i);
+          if (k && /^(fsm_dyn|fsm_dynamic_|fsm_wechsler_)/.test(k)) {
+            keysToMigrate.push(k);
+          }
+        }
+        keysToMigrate.forEach(k => {
+          const existing = GM_getValue(k, null);
+          if (existing === null) {
+            const val = nativeLS.getItem(k);
+            if (val !== null) GM_setValue(k, val);
+          }
+          nativeLS.removeItem(k);
+        });
+      } catch (e) {}
+    }
+
+    return {
+      getItem(key) {
+        try {
+          if (hasGM) {
+            const val = GM_getValue(key, null);
+            return val === undefined ? null : val;
+          }
+          return nativeLS ? nativeLS.getItem(key) : null;
+        } catch (e) { return null; }
+      },
+      setItem(key, value) {
+        try {
+          const strVal = String(value);
+          if (hasGM) GM_setValue(key, strVal);
+          else if (nativeLS) nativeLS.setItem(key, strVal);
+        } catch (e) {}
+      },
+      removeItem(key) {
+        try {
+          if (hasGM && typeof GM_deleteValue === 'function') GM_deleteValue(key);
+          else if (nativeLS) nativeLS.removeItem(key);
+        } catch (e) {}
+      },
+      onChange(key, callback) {
+        if (typeof GM_addValueChangeListener === 'function') {
+          GM_addValueChangeListener(key, (_name, _oldVal, newVal) => {
+            try { callback(newVal); } catch (e) {}
+          });
+        } else {
+          window.addEventListener('storage', (e) => {
+            if (e.key === key) {
+              try { callback(e.newValue); } catch (err) {}
+            }
+          });
+        }
+      }
+    };
+  })();
 
   function escapeHtml(val) {
+    const AMP = String.fromCharCode(38);
     return String(val ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
+      .replace(/&/g, AMP + 'amp;')
+      .replace(/</g, AMP + 'lt;')
+      .replace(/>/g, AMP + 'gt;')
+      .replace(/"/g, AMP + 'quot;')
+      .replace(/'/g, AMP + '#39;');
+  }
+
+  function debounce(fn, delay = 150) {
+    let timer = null;
+    return function (...args) {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn.apply(this, args), delay);
+    };
   }
 
   function isolateKeys(el) {
@@ -46,451 +130,6 @@
     });
   }
 
-  // Umgeht die CSP & den Angular Service Worker (ngsw-worker.js) für externe Aufrufe (Google Sheets / Imgur)
-  function externalRequestJson(url, { method = 'GET', headers = {}, body = null, timeout = 12000 } = {}) {
-    return new Promise((resolve, reject) => {
-      if (typeof GM_xmlhttpRequest === 'function') {
-        GM_xmlhttpRequest({
-          method,
-          url,
-          headers,
-          data: body,
-          timeout,
-          onload: (res) => {
-            try {
-              const parsed = JSON.parse(res.responseText || '{}');
-              resolve(parsed);
-            } catch (err) {
-              reject(new Error('Ungültige JSON-Antwort vom Google Sheet.'));
-            }
-          },
-          onerror: () => reject(new Error('Netzwerkfehler beim Verbinden mit Google Sheet.')),
-          ontimeout: () => reject(new Error('Zeitüberschreitung (Timeout) bei Google Sheet.'))
-        });
-      } else {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), timeout);
-        fetch(url, {
-          method,
-          redirect: 'follow',
-          headers,
-          body,
-          signal: ctrl.signal
-        })
-          .then(r => r.json())
-          .then(resolve)
-          .catch(reject)
-          .finally(() => clearTimeout(timer));
-      }
-    });
-  }
-
-  // Schützt die virtuelle Route /check vor dem Überschreiben durch den Angular 20 Router
-  const initialIsCheckRoute = location.pathname.startsWith('/check');
-  const initialCheckUrl = location.href;
-
-  // Dark Mode auf der Hauptseite sofort vor dem ersten Rendern aktivieren (mit Null-Schutz für document-start)
-  try {
-    if (!initialIsCheckRoute && localStorage.getItem('fsm_dynamic_theme') === 'dark') {
-      if (document.documentElement) {
-        document.documentElement.classList.add('dyn-portal-dark');
-      } else {
-        document.addEventListener('DOMContentLoaded', () => {
-          document.documentElement.classList.add('dyn-portal-dark');
-        }, { once: true });
-      }
-    }
-  } catch (e) {}
-
-  // ============================================================================
-  // 0. CUSTOM LOGO MANAGER & GOOGLE SHEETS NOTIZEN-MANAGER
-  // ============================================================================
-  const CustomLogoManager = {
-    dataUrl: CUSTOM_LOGO_URL,
-
-    init() {
-      try {
-        const cached = localStorage.getItem(CUSTOM_LOGO_CACHE_KEY);
-        if (cached && cached.startsWith('data:image/')) {
-          this.dataUrl = cached;
-          return;
-        }
-      } catch (e) {}
-      this.dataUrl = CUSTOM_LOGO_URL;
-      this.fetchAndCache();
-    },
-
-    getSrc() {
-      return this.dataUrl || CUSTOM_LOGO_URL;
-    },
-
-    fetchAndCache() {
-      const saveBlob = (blob) => {
-        if (!blob || !blob.size) return;
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const result = String(reader.result || '');
-          if (result.startsWith('data:image/')) {
-            this.dataUrl = result;
-            try {
-              localStorage.setItem('fsm_dyn_custom_logo_src', CUSTOM_LOGO_URL);
-              localStorage.setItem(CUSTOM_LOGO_CACHE_KEY, result);
-            } catch (e) {}
-            this.apply();
-          }
-        };
-        reader.readAsDataURL(blob);
-      };
-
-      if (typeof GM_xmlhttpRequest === 'function') {
-        GM_xmlhttpRequest({
-          method: 'GET',
-          url: CUSTOM_LOGO_URL,
-          responseType: 'blob',
-          headers: { 'Accept': 'image/png,image/*,*/*' },
-          onload: (res) => {
-            if (res.status >= 200 && res.status < 300 && res.response) {
-              saveBlob(res.response);
-            }
-          }
-        });
-      } else {
-        fetch(CUSTOM_LOGO_URL, { referrerPolicy: 'no-referrer' })
-          .then(r => (r.ok ? r.blob() : null))
-          .then(blob => { if (blob) saveBlob(blob); })
-          .catch(() => {});
-      }
-    },
-
-    apply() {
-      const src = this.getSrc();
-      if (!src) return;
-
-      // 1. Dynamisches Stylesheet für CSS-basierte Logos aktualisieren
-      if (document.head) {
-        let logoStyle = document.getElementById('dyn-custom-logo-style');
-        if (!logoStyle) {
-          logoStyle = document.createElement('style');
-          logoStyle.id = 'dyn-custom-logo-style';
-          document.head.appendChild(logoStyle);
-        }
-        logoStyle.textContent = `
-          app-navbar img[src*="fsmlogo"],
-          nav.main-menu img[src*="fsmlogo"],
-          img[src*="fsmlogo-.png"],
-          img.dyn-custom-logo-img {
-            content: url("${src}") !important;
-            object-fit: contain !important;
-            max-height: 44px !important;
-            max-width: 100% !important;
-            width: auto !important;
-          }
-        `;
-      }
-
-      // 2. Alle <img>-Elemente (Hauptseite & /check) direkt aktualisieren
-      document.querySelectorAll('app-navbar img[src*="fsmlogo"], nav.main-menu img[src*="fsmlogo"], img[src*="fsmlogo"], img.dyn-custom-logo-img').forEach(img => {
-        img.classList.add('dyn-custom-logo-img');
-        if (img.src !== src) {
-          img.src = src;
-          img.removeAttribute('srcset');
-        }
-        img.style.objectFit = 'contain';
-        img.style.maxHeight = '44px';
-        img.style.maxWidth = '100%';
-        img.style.width = 'auto';
-      });
-
-      // 3. Falls Angular das Logo als CSS background-image rendert, ebenfalls ersetzen
-      document.querySelectorAll('app-navbar *, nav.main-menu *').forEach(el => {
-        if (el.dataset.dynBgLogoApplied === '1') return;
-        const bg = getComputedStyle(el).backgroundImage;
-        if (bg && bg.includes('fsmlogo')) {
-          el.dataset.dynBgLogoApplied = '1';
-          el.style.setProperty('background-image', `url("${src}")`, 'important');
-          el.style.setProperty('background-size', 'contain', 'important');
-          el.style.setProperty('background-repeat', 'no-repeat', 'important');
-          el.style.setProperty('background-position', 'center', 'important');
-        }
-      });
-    }
-  };
-
-  CustomLogoManager.init();
-
-  const NotesManager = {
-    map: new Map(),
-    listeners: new Set(),
-    lastSync: 0,
-    isSyncing: false,
-
-    init() {
-      try {
-        const raw = localStorage.getItem('fsm_dyn_notes_cache');
-        if (raw) {
-          const obj = JSON.parse(raw);
-          Object.entries(obj).forEach(([k, v]) => this.map.set(String(k), v));
-        }
-      } catch (e) {}
-    },
-
-    saveCache() {
-      try {
-        const obj = {};
-        this.map.forEach((v, k) => { obj[k] = v; });
-        localStorage.setItem('fsm_dyn_notes_cache', JSON.stringify(obj));
-      } catch (e) {}
-    },
-
-    notify() {
-      this.listeners.forEach(fn => {
-        try { fn(); } catch (e) {}
-      });
-    },
-
-    getEndpoint() {
-      return (localStorage.getItem('fsm_dyn_gscript_url') || DEFAULT_GSCRIPT_URL || '').trim();
-    },
-
-    setEndpoint(url) {
-      const clean = String(url || '').trim();
-      if (clean) localStorage.setItem('fsm_dyn_gscript_url', clean);
-      else localStorage.removeItem('fsm_dyn_gscript_url');
-    },
-
-    get(studentId) {
-      return this.map.get(String(studentId)) || { note: '', priority: 'normal', updatedAt: '', updatedBy: '' };
-    },
-
-    badgeHtml(studentId) {
-      const entry = this.map.get(String(studentId));
-      if (!entry || !entry.note) return '';
-      const isWarn = entry.priority === 'warn';
-      return `<span class="dyn-note-indicator ${isWarn ? 'warn' : ''}" title="${escapeHtml(entry.note)}">${isWarn ? '⚠️' : '📝'} Notiz</span>`;
-    },
-
-    async syncAll(force = false) {
-      const url = this.getEndpoint();
-      if (!url || !url.startsWith('https://script.google.com')) return;
-      if (this.isSyncing) return;
-      if (!force && Date.now() - this.lastSync < 20000) return;
-
-      this.isSyncing = true;
-      try {
-        const sep = url.includes('?') ? '&' : '?';
-        const data = await externalRequestJson(`${url}${sep}t=${Date.now()}`, {
-          method: 'GET',
-          timeout: 10000
-        });
-        if (data && Array.isArray(data.entries)) {
-          this.map.clear();
-          data.entries.forEach(e => {
-            if (e && e.studentId && e.note) {
-              this.map.set(String(e.studentId), e);
-            }
-          });
-          this.lastSync = Date.now();
-          this.saveCache();
-          this.notify();
-        }
-      } catch (e) {
-        console.warn('[Dynamic Notes] Sync-Fehler:', e);
-      } finally {
-        this.isSyncing = false;
-      }
-    },
-
-    async save(student, noteText, priority = 'normal') {
-      const cleanNote = String(noteText || '').trim();
-      const cleanPrio = priority === 'warn' ? 'warn' : 'normal';
-      const author = localStorage.getItem('fsm_dynamic_worker_name') || 'Büro';
-      const nowStr = new Date().toLocaleString('de-DE', {
-        day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
-      });
-
-      const localEntry = {
-        studentId: String(student.id),
-        karteiNr: student._karteiNr || '',
-        name: `${student._nachname || ''}, ${student._vorname || ''}`.trim(),
-        note: cleanNote,
-        priority: cleanPrio,
-        updatedBy: author,
-        updatedAt: nowStr
-      };
-
-      if (cleanNote) this.map.set(String(student.id), localEntry);
-      else this.map.delete(String(student.id));
-      this.saveCache();
-      this.notify();
-
-      const url = this.getEndpoint();
-      if (!url || !url.startsWith('https://script.google.com')) {
-        return { ...localEntry, localOnly: true };
-      }
-
-      const payload = {
-        studentId: String(student.id),
-        karteiNr: localEntry.karteiNr,
-        name: localEntry.name,
-        note: cleanNote,
-        priority: cleanPrio,
-        updatedBy: author
-      };
-
-      const data = await externalRequestJson(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload),
-        timeout: 12000
-      });
-
-      if (!data || !data.ok) {
-        throw new Error(data?.error || 'Google Sheet hat das Speichern abgelehnt.');
-      }
-
-      const finalEntry = data.entry || localEntry;
-      if (cleanNote) this.map.set(String(student.id), finalEntry);
-      else this.map.delete(String(student.id));
-      this.saveCache();
-      this.notify();
-
-      return finalEntry;
-    }
-  };
-
-  NotesManager.init();
-
-  // ============================================================================
-  // 1. GEMEINSAMER SCHÜLER- & KARTEI-SPEICHER (INKL. AUTO-SYNC)
-  // ============================================================================
-  const StudentStore = {
-    list: [],
-    karteiMap: new Map(),
-    lastFetch: 0,
-    isFetching: false,
-    includeInactive: false,
-    listeners: new Set(),
-
-    buildUrl(includeInactive = false) {
-      const onlyActive = includeInactive ? 'false' : 'true';
-      const url = new URL(`${BASE_ORIGIN}/bff/api/v3/schueler/suche`);
-      const params = {
-        name: '', vorname: '', bezeichnung: '', kennzeichen: '', strasse: '', ort: '',
-        karteiNr: '', telefon: '', klasse: '',
-        fidkostentraeger: '', zusatzfeld1: '', zusatzfeld2: '', zusatzfeld3: '', geburtsdatum: '',
-        einfacheSuche: 'true', bankeinzug: '', searchText: '',
-        onlyActive,
-        'filter.reference': 'Alle', 'filter.label': 'Alle', 'filter.type': 'Alle',
-        'filter.typeLabel': 'Alle', 'filter.activeFlag': onlyActive, 'filter.listFlag': 'true',
-        'filter.archivFlag': 'false', 'filter.letter': '', 'filter.index': '', 'filter.count': '',
-        'customFilter.condition': ''
-      };
-      Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-      return url.toString();
-    },
-
-    normalize(s) {
-      const klassenStr = Array.isArray(s.klassen) ? s.klassen.join(', ') : String(s.klassen ?? '');
-      const nachname = String(s.nachname ?? s.name ?? '');
-      const vorname = String(s.vorname ?? '');
-      const karteiNr = String(s.karteiNr ?? s.displayKarteinummer ?? '');
-      const id = String(s.id ?? '');
-      const fullStr = `${vorname} ${nachname} ${karteiNr} ${id}`.toLowerCase();
-      const words = fullStr.split(/[\s,.\-_()/]+/).filter(Boolean);
-      return {
-        ...s,
-        _nachname: nachname,
-        _vorname: vorname,
-        _karteiNr: karteiNr,
-        _klassenStr: klassenStr,
-        _klassenLower: klassenStr.toLowerCase(),
-        _searchLower: fullStr,
-        _words: words
-      };
-    },
-
-    async refresh(force = false, includeInactive = this.includeInactive) {
-      if (this.isFetching) return this.list;
-      const age = Date.now() - this.lastFetch;
-      if (!force && this.list.length > 0 && age < 15000 && includeInactive === this.includeInactive) {
-        return this.list;
-      }
-
-      this.isFetching = true;
-      this.includeInactive = includeInactive;
-      try {
-        NotesManager.syncAll(force);
-        const res = await fetch(this.buildUrl(includeInactive), {
-          headers: API_HEADERS,
-          credentials: 'include'
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const raw = await res.json();
-        const rows = Array.isArray(raw.rows)
-          ? raw.rows.map(r => (r && typeof r === 'object') ? (r.d || r.data || r) : r)
-          : [];
-        this.list = rows.filter(s => s && s.id).map(s => this.normalize(s));
-        this.lastFetch = Date.now();
-        this.listeners.forEach(fn => fn(this.list));
-      } catch (e) {
-        console.warn('[Dynamic Store] Sync-Fehler:', e);
-      } finally {
-        this.isFetching = false;
-      }
-      return this.list;
-    },
-
-    async fetchKartei(studentId, force = false) {
-      if (!force && this.karteiMap.has(studentId)) return this.karteiMap.get(studentId);
-      const res = await fetch(`${BASE_ORIGIN}/bff/api/v1/schueler/kartei/${encodeURIComponent(studentId)}`, {
-        headers: API_HEADERS,
-        credentials: 'include'
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      this.karteiMap.set(studentId, data);
-      return data;
-    },
-
-    search(query, { wordStart = true, limit = 15 } = {}) {
-      const tokens = (query || '').toLowerCase().trim().split(/[\s,.\-_()/]+/).filter(Boolean);
-      if (tokens.length === 0) return [];
-      const matches = [];
-      for (let i = 0; i < this.list.length; i++) {
-        const s = this.list[i];
-        let ok = true;
-        for (let t = 0; t < tokens.length; t++) {
-          const tok = tokens[t];
-          if (wordStart) {
-            if (!s._words.some(w => w.startsWith(tok))) { ok = false; break; }
-          } else {
-            if (!s._searchLower.includes(tok)) { ok = false; break; }
-          }
-        }
-        if (ok) {
-          matches.push(s);
-          if (matches.length >= limit) break;
-        }
-      }
-      return matches;
-    }
-  };
-
-  setInterval(() => {
-    StudentStore.refresh(true);
-    NotesManager.syncAll(true);
-  }, 120000);
-
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && Date.now() - StudentStore.lastFetch > 30000) {
-      StudentStore.refresh(true);
-      NotesManager.syncAll(true);
-    }
-  });
-
-  // ============================================================================
-  // 2. STRUKTURIERTER KARTEI-PARSER (INKL. ABTEIL 5: BÜRO-NOTIZ)
-  // ============================================================================
   function pickProp(obj, ...candidates) {
     if (!obj || typeof obj !== 'object') return undefined;
     const entries = Object.entries(obj);
@@ -528,8 +167,559 @@
     return String(rounded).replace('.', ',');
   }
 
+  // Zentrale 2-Jahres-Fristprüfung (§ 4 Abs. 6 FahrschAusbO) für interne & Wechsler-Stunden
+  function checkTwoYearValidity(isoDate) {
+    if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
+      return { status: 'missing', label: 'Datum fehlt', expiresDe: '—', daysLeft: null, isExpired: false };
+    }
+    const [y, m, d] = isoDate.split('-').map(Number);
+    const expiryDate = new Date(y + 2, m - 1, d);
+    expiryDate.setHours(0, 0, 0, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const diffMs = expiryDate.getTime() - today.getTime();
+    const daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+    const expiresDe = `${String(expiryDate.getDate()).padStart(2, '0')}.${String(expiryDate.getMonth() + 1).padStart(2, '0')}.${expiryDate.getFullYear()}`;
+
+    if (daysLeft < 0) {
+      return {
+        status: 'expired',
+        label: `Abgelaufen seit ${expiresDe} (${Math.abs(daysLeft)} T.)`,
+        expiresDe,
+        daysLeft,
+        isExpired: true
+      };
+    }
+    if (daysLeft <= 60) {
+      return {
+        status: 'expiring',
+        label: `Läuft ab am ${expiresDe} (noch ${daysLeft} T.)`,
+        expiresDe,
+        daysLeft,
+        isExpired: false
+      };
+    }
+    return {
+      status: 'valid',
+      label: `Gültig bis ${expiresDe}`,
+      expiresDe,
+      daysLeft,
+      isExpired: false
+    };
+  }
+
+  // Umgeht die CSP & den Angular Service Worker (ngsw-worker.js) für externe Aufrufe (Google Sheets / Imgur)
+  function externalRequestJson(url, { method = 'GET', headers = {}, body = null, timeout = 12000 } = {}) {
+    const isGScript = String(url).startsWith('https://script.google.com');
+    const sendGm = (anonymous) => new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url,
+        headers,
+        data: body,
+        timeout,
+        anonymous,
+        onload: (res) => {
+          if (res.status < 200 || res.status >= 300) {
+            const err = new Error(`HTTP ${res.status} vom Google Sheet.`);
+            err.status = res.status;
+            reject(err);
+            return;
+          }
+          try {
+            const parsed = JSON.parse(res.responseText || '{}');
+            resolve(parsed);
+          } catch (err) {
+            reject(new Error('Ungültige JSON-Antwort vom Google Sheet.'));
+          }
+        },
+        onerror: () => reject(new Error('Netzwerkfehler beim Verbinden mit Google Sheet.')),
+        ontimeout: () => reject(new Error('Zeitüberschreitung (Timeout) bei Google Sheet.'))
+      });
+    });
+
+    if (typeof GM_xmlhttpRequest === 'function') {
+      if (isGScript) {
+        return sendGm(true).catch((err) => {
+          if (err && (err.status === 401 || err.status === 403)) {
+            return sendGm(false);
+          }
+          throw err;
+        });
+      }
+      return sendGm(false);
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    return fetch(url, {
+      method,
+      redirect: 'follow',
+      headers,
+      body,
+      signal: ctrl.signal
+    })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .finally(() => clearTimeout(timer));
+  }
+
+  // Schützt die virtuelle Route /check vor dem Überschreiben durch den Angular 20 Router
+  const initialIsCheckRoute = location.pathname.startsWith('/check');
+  const initialCheckUrl = location.href;
+
+  // Dark Mode auf der Hauptseite sofort vor dem ersten Rendern aktivieren
+  try {
+    if (!initialIsCheckRoute && DynStorage.getItem('fsm_dynamic_theme') === 'dark') {
+      if (document.documentElement) {
+        document.documentElement.classList.add('dyn-portal-dark');
+      } else {
+        document.addEventListener('DOMContentLoaded', () => {
+          document.documentElement.classList.add('dyn-portal-dark');
+        }, { once: true });
+      }
+    }
+  } catch (e) {}
+
+  // ============================================================================
+  // 0. CUSTOM LOGO MANAGER & GOOGLE SHEETS NOTIZEN-MANAGER
+  // ============================================================================
+  const CustomLogoManager = {
+    dataUrl: CUSTOM_LOGO_URL,
+    isFetching: false,
+
+    init() {
+      try {
+        const cachedSrc = DynStorage.getItem(CUSTOM_LOGO_SRC_KEY);
+        const cached = DynStorage.getItem(CUSTOM_LOGO_CACHE_KEY);
+        if (cachedSrc === CUSTOM_LOGO_URL && cached && cached.startsWith('data:image/')) {
+          this.dataUrl = cached;
+          return;
+        }
+      } catch (e) {}
+      this.dataUrl = CUSTOM_LOGO_URL;
+      this.fetchAndCache();
+    },
+
+    getSrc() {
+      return this.dataUrl || CUSTOM_LOGO_URL;
+    },
+
+    fetchAndCache() {
+      if (this.isFetching) return;
+      this.isFetching = true;
+
+      const saveBlob = (blob) => {
+        if (!blob || !blob.size) {
+          this.isFetching = false;
+          return;
+        }
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          this.isFetching = false;
+          const result = String(reader.result || '');
+          if (result.startsWith('data:image/')) {
+            this.dataUrl = result;
+            try {
+              DynStorage.setItem(CUSTOM_LOGO_SRC_KEY, CUSTOM_LOGO_URL);
+              DynStorage.setItem(CUSTOM_LOGO_CACHE_KEY, result);
+            } catch (e) {}
+            this.apply();
+          }
+        };
+        reader.onerror = () => { this.isFetching = false; };
+        reader.readAsDataURL(blob);
+      };
+
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: CUSTOM_LOGO_URL,
+          responseType: 'blob',
+          headers: { 'Accept': 'image/png,image/*,*/*' },
+          onload: (res) => {
+            if (res.status >= 200 && res.status < 300 && res.response) {
+              saveBlob(res.response);
+            } else {
+              this.isFetching = false;
+            }
+          },
+          onerror: () => { this.isFetching = false; },
+          ontimeout: () => { this.isFetching = false; }
+        });
+      } else {
+        fetch(CUSTOM_LOGO_URL, { referrerPolicy: 'no-referrer' })
+          .then(r => (r.ok ? r.blob() : null))
+          .then(blob => {
+            if (blob) saveBlob(blob);
+            else this.isFetching = false;
+          })
+          .catch(() => { this.isFetching = false; });
+      }
+    },
+
+    apply() {
+      const src = this.getSrc();
+      if (!src) return;
+
+      // 1. Dynamisches Stylesheet für CSS-basierte Logos (nutzt gecachte Data-URL gegen CSP-Blocker)
+      if (document.head) {
+        let logoStyle = document.getElementById('dyn-custom-logo-style');
+        if (!logoStyle) {
+          logoStyle = document.createElement('style');
+          logoStyle.id = 'dyn-custom-logo-style';
+          document.head.appendChild(logoStyle);
+        }
+        const safeCssUrl = src.replace(/"/g, '\\"');
+        logoStyle.textContent = `
+          app-navbar img[src*="fsmlogo"],
+          nav.main-menu img[src*="fsmlogo"],
+          img[src*="fsmlogo"],
+          img.dyn-custom-logo-img {
+            content: url("${safeCssUrl}") !important;
+            object-fit: contain !important;
+            max-height: 44px !important;
+            max-width: 100% !important;
+            width: auto !important;
+          }
+        `;
+      }
+
+      // 2. Alle <img>-Elemente (Hauptseite & /check) direkt aktualisieren
+      document.querySelectorAll('app-navbar img[src*="fsmlogo"], nav.main-menu img[src*="fsmlogo"], img[src*="fsmlogo"], img.dyn-custom-logo-img').forEach(img => {
+        img.classList.add('dyn-custom-logo-img');
+        if (img.getAttribute('src') !== src) {
+          img.src = src;
+          img.removeAttribute('srcset');
+        }
+        img.style.objectFit = 'contain';
+        img.style.maxHeight = '44px';
+        img.style.maxWidth = '100%';
+        img.style.width = 'auto';
+      });
+
+      // 3. Falls Angular das Logo als CSS background-image rendert (gezielt nur auf Logo-Containern)
+      document.querySelectorAll('app-navbar a, app-navbar div, nav.main-menu a, nav.main-menu div').forEach(el => {
+        if (el.dataset.dynBgLogoApplied === '1') return;
+        const bg = getComputedStyle(el).backgroundImage;
+        if (bg && bg.includes('fsmlogo')) {
+          el.dataset.dynBgLogoApplied = '1';
+          el.style.setProperty('background-image', `url("${src}")`, 'important');
+          el.style.setProperty('background-size', 'contain', 'important');
+          el.style.setProperty('background-repeat', 'no-repeat', 'important');
+          el.style.setProperty('background-position', 'center', 'important');
+        }
+      });
+    }
+  };
+
+  CustomLogoManager.init();
+
+  const NotesManager = {
+    map: new Map(),
+    listeners: new Set(),
+    lastSync: 0,
+    isSyncing: false,
+    pendingSaves: 0,
+
+    init() {
+      try {
+        const raw = DynStorage.getItem('fsm_dyn_notes_cache');
+        if (raw) {
+          const obj = JSON.parse(raw);
+          Object.entries(obj).forEach(([k, v]) => this.map.set(String(k), v));
+        }
+      } catch (e) {}
+    },
+
+    saveCache() {
+      try {
+        const obj = {};
+        this.map.forEach((v, k) => { obj[k] = v; });
+        DynStorage.setItem('fsm_dyn_notes_cache', JSON.stringify(obj));
+      } catch (e) {}
+    },
+
+    notify() {
+      this.listeners.forEach(fn => {
+        try { fn(); } catch (e) {}
+      });
+    },
+
+    getEndpoint() {
+      return (DynStorage.getItem('fsm_dyn_gscript_url') || DEFAULT_GSCRIPT_URL || '').trim();
+    },
+
+    setEndpoint(url) {
+      const clean = String(url || '').trim();
+      if (clean) DynStorage.setItem('fsm_dyn_gscript_url', clean);
+      else DynStorage.removeItem('fsm_dyn_gscript_url');
+    },
+
+    get(studentId) {
+      return this.map.get(String(studentId)) || { note: '', priority: 'normal', updatedAt: '', updatedBy: '' };
+    },
+
+    badgeHtml(studentId) {
+      const entry = this.map.get(String(studentId));
+      if (!entry || !entry.note) return '';
+      const isWarn = entry.priority === 'warn';
+      return `<span class="dyn-note-indicator ${isWarn ? 'warn' : ''}" title="${escapeHtml(entry.note)}">${isWarn ? '⚠️' : '📝'} Notiz</span>`;
+    },
+
+    async syncAll(force = false) {
+      const url = this.getEndpoint();
+      if (!url || !url.startsWith('https://script.google.com')) return false;
+      if (this.isSyncing || this.pendingSaves > 0) return false;
+      if (!force && Date.now() - this.lastSync < 20000) return false;
+
+      this.isSyncing = true;
+      try {
+        const sep = url.includes('?') ? '&' : '?';
+        const data = await externalRequestJson(`${url}${sep}t=${Date.now()}`, {
+          method: 'GET',
+          timeout: 10000
+        });
+        if (this.pendingSaves === 0 && data && Array.isArray(data.entries)) {
+          this.map.clear();
+          data.entries.forEach(e => {
+            if (e && e.studentId && e.note) {
+              this.map.set(String(e.studentId), e);
+            }
+          });
+          this.lastSync = Date.now();
+          this.saveCache();
+          this.notify();
+          return true;
+        }
+      } catch (e) {
+        console.warn('[Dynamic Notes] Sync-Fehler:', e);
+      } finally {
+        this.isSyncing = false;
+      }
+      return false;
+    },
+
+    async save(student, noteText, priority = 'normal') {
+      const sid = String(student.id);
+      const cleanNote = String(noteText || '').trim();
+      const cleanPrio = priority === 'warn' ? 'warn' : 'normal';
+      const author = DynStorage.getItem('fsm_dynamic_worker_name') || 'Büro';
+      const nowStr = new Date().toLocaleString('de-DE', {
+        day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
+      });
+
+      const localEntry = {
+        studentId: sid,
+        karteiNr: student._karteiNr || '',
+        name: `${student._nachname || ''}, ${student._vorname || ''}`.trim(),
+        note: cleanNote,
+        priority: cleanPrio,
+        updatedBy: author,
+        updatedAt: nowStr
+      };
+
+      if (cleanNote) this.map.set(sid, localEntry);
+      else this.map.delete(sid);
+      this.saveCache();
+      this.notify();
+
+      const url = this.getEndpoint();
+      if (!url || !url.startsWith('https://script.google.com')) {
+        return { ...localEntry, localOnly: true };
+      }
+
+      const payload = {
+        studentId: sid,
+        karteiNr: localEntry.karteiNr,
+        name: localEntry.name,
+        note: cleanNote,
+        priority: cleanPrio,
+        updatedBy: author
+      };
+
+      this.pendingSaves++;
+      try {
+        const data = await externalRequestJson(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(payload),
+          timeout: 12000
+        });
+
+        if (!data || !data.ok) {
+          throw new Error(data?.error || 'Google Sheet hat das Speichern abgelehnt.');
+        }
+
+        const finalEntry = data.entry || localEntry;
+        if (cleanNote) this.map.set(sid, finalEntry);
+        else this.map.delete(sid);
+        this.saveCache();
+        this.notify();
+
+        return finalEntry;
+      } finally {
+        this.pendingSaves = Math.max(0, this.pendingSaves - 1);
+      }
+    }
+  };
+
+  NotesManager.init();
+
+  // ============================================================================
+  // TEIL 2/5: SCHÜLER-STORE, KARTEI-PARSER, NOTIZ-EVENTS & BOOT-ROUTER
+  // ============================================================================
+  const StudentStore = {
+    list: [],
+    karteiMap: new Map(),
+    lastFetch: 0,
+    isFetching: false,
+    fetchPromise: null,
+    includeInactive: false,
+    listeners: new Set(),
+
+    buildUrl(includeInactive = false) {
+      const onlyActive = includeInactive ? 'false' : 'true';
+      const url = new URL(`${BASE_ORIGIN}/bff/api/v3/schueler/suche`);
+      const params = {
+        name: '', vorname: '', bezeichnung: '', kennzeichen: '', strasse: '', ort: '',
+        karteiNr: '', telefon: '', klasse: '',
+        fidkostentraeger: '', zusatzfeld1: '', zusatzfeld2: '', zusatzfeld3: '', geburtsdatum: '',
+        einfacheSuche: 'true', bankeinzug: '', searchText: '',
+        onlyActive,
+        'filter.reference': 'Alle', 'filter.label': 'Alle', 'filter.type': 'Alle',
+        'filter.typeLabel': 'Alle', 'filter.activeFlag': onlyActive, 'filter.listFlag': 'true',
+        'filter.archivFlag': 'false', 'filter.letter': '', 'filter.index': '', 'filter.count': '',
+        'customFilter.condition': ''
+      };
+      Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+      return url.toString();
+    },
+
+    normalize(s) {
+      const klassenStr = Array.isArray(s.klassen) ? s.klassen.join(', ') : String(s.klassen ?? '');
+      const nachname = String(s.nachname ?? s.name ?? '');
+      const vorname = String(s.vorname ?? '');
+      const karteiNr = String(s.karteiNr ?? s.displayKarteinummer ?? '');
+      const id = String(s.id ?? '');
+      const fullStr = `${vorname} ${nachname} ${karteiNr} ${id}`.toLowerCase();
+      const words = fullStr.split(/[\s,.\-_()/]+/).filter(Boolean);
+      return {
+        ...s,
+        id,
+        _nachname: nachname,
+        _vorname: vorname,
+        _karteiNr: karteiNr,
+        _klassenStr: klassenStr,
+        _klassenLower: klassenStr.toLowerCase(),
+        _searchLower: fullStr,
+        _words: words
+      };
+    },
+
+    async refresh(force = false, includeInactive = this.includeInactive) {
+      const targetInactive = Boolean(includeInactive);
+      if (this.fetchPromise) {
+        if (targetInactive === this.includeInactive) return this.fetchPromise;
+        await this.fetchPromise;
+      }
+
+      const age = Date.now() - this.lastFetch;
+      if (!force && this.list.length > 0 && age < 15000 && targetInactive === this.includeInactive) {
+        return this.list;
+      }
+
+      this.isFetching = true;
+      this.includeInactive = targetInactive;
+
+      this.fetchPromise = (async () => {
+        try {
+          NotesManager.syncAll(force);
+          const res = await fetch(this.buildUrl(targetInactive), {
+            headers: API_HEADERS,
+            credentials: 'include'
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const raw = await res.json();
+          const rows = Array.isArray(raw.rows)
+            ? raw.rows.map(r => (r && typeof r === 'object') ? (r.d || r.data || r) : r)
+            : [];
+          this.list = rows.filter(s => s && s.id !== undefined && s.id !== null && s.id !== '').map(s => this.normalize(s));
+          this.lastFetch = Date.now();
+          this.listeners.forEach(fn => {
+            try { fn(this.list); } catch (e) {}
+          });
+        } catch (e) {
+          console.warn('[Dynamic Store] Sync-Fehler:', e);
+        } finally {
+          this.isFetching = false;
+          this.fetchPromise = null;
+        }
+        return this.list;
+      })();
+
+      return this.fetchPromise;
+    },
+
+    async fetchKartei(studentId, force = false) {
+      const sid = String(studentId ?? '');
+      if (!sid) throw new Error('Ungültige Schüler-ID');
+      if (!force && this.karteiMap.has(sid)) return this.karteiMap.get(sid);
+      const res = await fetch(`${BASE_ORIGIN}/bff/api/v1/schueler/kartei/${encodeURIComponent(sid)}`, {
+        headers: API_HEADERS,
+        credentials: 'include'
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      this.karteiMap.set(sid, data);
+      return data;
+    },
+
+    search(query, { wordStart = true, limit = 15 } = {}) {
+      const tokens = (query || '').toLowerCase().trim().split(/[\s,.\-_()/]+/).filter(Boolean);
+      if (tokens.length === 0) return [];
+      const matches = [];
+      for (let i = 0; i < this.list.length; i++) {
+        const s = this.list[i];
+        let ok = true;
+        for (let t = 0; t < tokens.length; t++) {
+          const tok = tokens[t];
+          if (wordStart) {
+            if (!s._words.some(w => w.startsWith(tok))) { ok = false; break; }
+          } else {
+            if (!s._searchLower.includes(tok)) { ok = false; break; }
+          }
+        }
+        if (ok) {
+          matches.push(s);
+          if (matches.length >= limit) break;
+        }
+      }
+      return matches;
+    }
+  };
+
+  setInterval(() => {
+    if (document.hidden) return;
+    StudentStore.refresh(true);
+    NotesManager.syncAll(true);
+  }, 120000);
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && Date.now() - StudentStore.lastFetch > 30000) {
+      StudentStore.refresh(true);
+      NotesManager.syncAll(true);
+    }
+  });
+
+  // ============================================================================
+  // 2. STRUKTURIERTER KARTEI-PARSER (INKL. ABTEIL 5: BÜRO-NOTIZ)
+  // ============================================================================
   function yesNoBadge(val, warnOnTrue = false) {
-    const isTrue = Boolean(val) && val !== 'Nein' && val !== 0;
+    const isTrue = Boolean(val) && val !== 'Nein' && val !== 'false' && val !== 0;
     if (isTrue) {
       return warnOnTrue
         ? `<span class="dyn-kpill warn">⚠️ Ja</span>`
@@ -540,10 +730,10 @@
 
   function buildKarteiCardsHtml(k, studentSummary = {}) {
     if (!k || typeof k !== 'object' || k.error) {
-      return `<div style="padding:14px; color:#b3261e;">Keine Karteidaten empfangen (${k?.error || 'Unbekannt'}).</div>`;
+      return `<div style="padding:14px; color:#b3261e;">Keine Karteidaten empfangen (${escapeHtml(k?.error || 'Unbekannt')}).</div>`;
     }
 
-    const studentId = studentSummary.id || pickProp(k, 'id') || '';
+    const studentId = String(studentSummary.id || pickProp(k, 'id') || '');
     const karteiNr = pickProp(k, 'displayKarteinummer', 'karteiNr') || studentSummary._karteiNr || '—';
     const anrede = pickProp(k, 'anrede') || '';
     const vorname = pickProp(k, 'vorname') || studentSummary._vorname || '';
@@ -572,8 +762,12 @@
     const rueckDatum = formatGermanDate(pickProp(k, 'ruecklauf_datum', 'ruecklaufDatum'));
     const rueckNr = pickProp(k, 'ruecklaufnummer', 'pruefauftrag') || '';
     const sprache = pickProp(k, 'fidsystempruefungssprache') || '';
-    const erteilungRaw = pickProp(k, 'fiderteilungsart') || '';
-    const erteilung = erteilungRaw === 'E' ? 'Ersterwerb (E)' : (erteilungRaw === 'W' ? 'Erweiterung (W)' : (erteilungRaw === 'U' ? 'Umschreibung (U)' : erteilungRaw));
+    const erteilungRaw = String(pickProp(k, 'fiderteilungsart') || '').toUpperCase();
+    const erteilung = erteilungRaw === 'E'
+      ? 'Ersterwerb (E)'
+      : (erteilungRaw === 'W'
+        ? 'Erweiterung (W)'
+        : (erteilungRaw === 'U' ? 'Umschreibung (U)' : erteilungRaw));
 
     const ausbildungen = Array.isArray(k.ausbildungen) ? k.ausbildungen : [];
     const firstAusb = ausbildungen[0] || {};
@@ -619,7 +813,7 @@
           </div>
           <div class="dyn-krow">
             <span class="dyn-klbl">Übungsfahrten (Basis)</span>
-            <span class="dyn-kval"><strong>${uebungsStd} Std.</strong></span>
+            <span class="dyn-kval"><strong>${escapeHtml(uebungsStd)} Std.</strong></span>
           </div>
           <div class="dyn-krow">
             <span class="dyn-klbl">Sonderfahrten (ÜL · AB · NF)</span>
@@ -657,7 +851,7 @@
       <!-- 5. INTERNE BÜRO-NOTIZ (GOOGLE SHEETS SYNC) -->
       <div class="dyn-kcard dyn-note-card ${isImportant ? 'important' : ''}" data-student-id="${escapeHtml(studentId)}">
         <div class="dyn-kcard-hdr dyn-note-hdr" style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-          <span>5. Interne Büro-Notiz ${hasGScript ? '(GSheet Sync)' : '(Lokal)'}</span>
+          <span class="dyn-note-title">5. Interne Büro-Notiz ${hasGScript ? '(GSheet Sync)' : '(Lokal)'}</span>
           <span class="dyn-note-meta" style="font-size:10.5px; font-weight:400; text-transform:none; opacity:0.92;">
             ${noteObj.updatedAt ? `${escapeHtml(noteObj.updatedBy || 'Büro')} · ${escapeHtml(noteObj.updatedAt)}` : 'Noch kein Eintrag'}
           </span>
@@ -683,7 +877,7 @@
               </span>
             </div>
             <div style="display:flex; gap:5px;">
-              ${noteObj.note ? `<button type="button" class="dyn-mini-btn dyn-note-clear" title="Notiz löschen">🗑️</button>` : ''}
+              <button type="button" class="dyn-mini-btn dyn-note-clear" title="Notiz löschen" style="${noteObj.note ? '' : 'display:none;'}">🗑️</button>
               <button type="button" class="dyn-mini-btn primary dyn-note-save">💾 Speichern</button>
             </div>
           </div>
@@ -697,6 +891,8 @@
     const card = containerEl.querySelector('.dyn-note-card');
     if (!card) return;
 
+    const sid = String(student.id);
+    const titleEl = card.querySelector('.dyn-note-title');
     const textarea = card.querySelector('.dyn-note-textarea');
     const prioChk = card.querySelector('.dyn-note-prio');
     const saveBtn = card.querySelector('.dyn-note-save');
@@ -706,6 +902,18 @@
     const metaEl = card.querySelector('.dyn-note-meta');
 
     isolateKeys(textarea);
+
+    function syncCardFromStore() {
+      const entry = NotesManager.get(sid);
+      const isImp = entry.priority === 'warn';
+      textarea.value = entry.note || '';
+      prioChk.checked = isImp;
+      card.classList.toggle('important', isImp);
+      if (clearBtn) clearBtn.style.display = entry.note ? 'inline-flex' : 'none';
+      metaEl.textContent = entry.note && entry.updatedAt
+        ? `${entry.updatedBy || 'Büro'} · ${entry.updatedAt}`
+        : 'Noch kein Eintrag';
+    }
 
     card.querySelectorAll('.dyn-tag-btn').forEach(btn => {
       btn.onclick = (e) => {
@@ -733,6 +941,7 @@
         metaEl.textContent = saved.note
           ? `${saved.updatedBy || 'Büro'} · ${saved.updatedAt || 'Gerade eben'}`
           : 'Notiz gelöscht';
+        if (clearBtn) clearBtn.style.display = saved.note ? 'inline-flex' : 'none';
         statusEl.style.color = '#166534';
         statusEl.textContent = saved.localOnly
           ? '✓ Lokal gespeichert (Sheet-URL fehlt noch)'
@@ -776,16 +985,26 @@
         current
       );
       if (input === null) return;
-      NotesManager.setEndpoint(input);
-      if (NotesManager.getEndpoint()) {
+      const clean = input.trim();
+      if (clean && !clean.startsWith('https://script.google.com')) {
+        statusEl.style.color = '#b3261e';
+        statusEl.textContent = '⚠️ URL muss mit https://script.google.com beginnen.';
+        return;
+      }
+      NotesManager.setEndpoint(clean);
+      const activeUrl = NotesManager.getEndpoint();
+      if (activeUrl) {
+        if (titleEl) titleEl.textContent = '5. Interne Büro-Notiz (GSheet Sync)';
         statusEl.style.color = '#0067B8';
         statusEl.textContent = 'Lade Notizen aus Google Sheet...';
         NotesManager.syncAll(true).then(() => {
+          syncCardFromStore();
           statusEl.style.color = '#166534';
           statusEl.textContent = '✓ Mit Google Sheet verbunden!';
           cfgBtn.textContent = '⚙️ Sheet-URL';
         });
       } else {
+        if (titleEl) titleEl.textContent = '5. Interne Büro-Notiz (Lokal)';
         statusEl.style.color = '#64748b';
         statusEl.textContent = 'Auf lokalen Speicher umgestellt.';
         cfgBtn.textContent = '⚙️ Sheet-URL verbinden';
@@ -829,7 +1048,7 @@
   }
 
   // ============================================================================
-  // ROUTE B: ORIGINALE FSM-WEBSITE (SIDEBAR + BLITZSUCHE + SCHNELL-KARTEI RECHTS + DARK MODE)
+  // TEIL 3/5: ORIGINALE FSM-WEBSITE (SIDEBAR + BLITZSUCHE + SCHNELL-KARTEI + DARK MODE)
   // ============================================================================
   function injectPortalEnhancements() {
     if (document.getElementById('dyn-portal-styles')) return;
@@ -840,16 +1059,7 @@
     }
 
     syncPortalTheme();
-    window.addEventListener('storage', (e) => {
-      if (e.key === 'fsm_dynamic_theme') syncPortalTheme();
-    });
-
-    if (!document.querySelector('link[href*="Material+Icons"]')) {
-      const iconFont = document.createElement('link');
-      iconFont.rel = 'stylesheet';
-      iconFont.href = 'https://fonts.googleapis.com/icon?family=Material+Icons';
-      document.head.appendChild(iconFont);
-    }
+    DynStorage.onChange('fsm_dynamic_theme', syncPortalTheme);
 
     const style = document.createElement('style');
     style.id = 'dyn-portal-styles';
@@ -1072,6 +1282,17 @@
       .dyn-klbl { font-weight: 500; color: #475569; flex: 1.1; }
       .dyn-kval { color: #0f172a; flex: 1.3; text-align: right; word-break: break-word; }
 
+      .dyn-kpill {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11.5px;
+        font-weight: 600;
+      }
+      .dyn-kpill.yes { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+      .dyn-kpill.no { background: #f8fafc; color: #64748b; border: 1px solid #cbd5e1; }
+      .dyn-kpill.warn { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
+
       .dyn-note-textarea {
         width: 100%;
         resize: vertical;
@@ -1090,17 +1311,6 @@
         border-color: #0067B8;
         background: #ffffff;
         box-shadow: 0 0 0 2px rgba(0, 103, 184, 0.16);
-      }
-
-      /* Eigenes Logo oben links auf der Hauptseite (ersetzt fsmlogo-.png) */
-      app-navbar img[src*="fsmlogo"],
-      nav.main-menu img[src*="fsmlogo"],
-      img[src*="fsmlogo"] {
-        content: url("https://i.imgur.com/Y17StTb.png") !important;
-        object-fit: contain !important;
-        max-height: 44px !important;
-        max-width: 100% !important;
-        width: auto !important;
       }
 
       /* --- MAIN SITE & DYNAMIC OVERLAYS DARK MODE --- */
@@ -1273,6 +1483,16 @@
         background: #11171d;
         border-color: #38bdf8;
       }
+      html.dyn-portal-dark .dyn-kpill.yes {
+        background: rgba(22, 163, 74, 0.16);
+        color: #6ee7b7;
+        border-color: rgba(22, 163, 74, 0.4);
+      }
+      html.dyn-portal-dark .dyn-kpill.warn {
+        background: rgba(217, 119, 6, 0.18);
+        color: #fcd34d;
+        border-color: rgba(217, 119, 6, 0.45);
+      }
       html.dyn-portal-dark .dyn-kpill.no {
         background: #172028;
         color: #94a3b8;
@@ -1280,6 +1500,7 @@
       }
     `;
     document.head.appendChild(style);
+    CustomLogoManager.apply();
 
     const karteiDrawer = document.createElement('aside');
     karteiDrawer.className = 'dyn-kartei-drawer';
@@ -1297,10 +1518,14 @@
     document.body.appendChild(karteiDrawer);
     karteiDrawer.querySelector('#dynKdClose').onclick = () => karteiDrawer.classList.remove('open');
 
+    let activeDrawerRequestId = 0;
+
     async function openStudentKartei(student) {
       if (!student || !student.id) return;
+      const reqId = ++activeDrawerRequestId;
+      const sid = encodeURIComponent(String(student.id));
 
-      const nativeRow = document.querySelector(`tr[data-key="${student.id}"]`);
+      const nativeRow = document.querySelector(`tr[data-key="${CSS.escape(String(student.id))}"]`);
       if (nativeRow) {
         nativeRow.click();
         nativeRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1315,16 +1540,16 @@
       subEl.textContent = `Kartei-Nr.: ${student._karteiNr || '—'} · Klasse: ${student._klassenStr || '—'}`;
 
       actionsEl.innerHTML = `
-        <a class="dyn-mini-btn accent" href="/check?mod=theorie&student=${student.id}">
+        <a class="dyn-mini-btn accent" href="/check?mod=theorie&student=${sid}">
           <i class="material-icons" style="font-size:14px;">fact_check</i> Theorie-Check
         </a>
-        <a class="dyn-mini-btn accent" href="/check?mod=praxis&student=${student.id}">
+        <a class="dyn-mini-btn accent" href="/check?mod=praxis&student=${sid}">
           <i class="material-icons" style="font-size:14px;">add_road</i> Pflichtfahrten
         </a>
-        <a class="dyn-mini-btn primary" href="/schueler/${student.id}/leistungen">
+        <a class="dyn-mini-btn primary" href="/schueler/${sid}/leistungen">
           <i class="material-icons" style="font-size:14px;">list_alt</i> Leistungen
         </a>
-        <a class="dyn-mini-btn" href="/schueler/${student.id}" title="Stammdaten bearbeiten">
+        <a class="dyn-mini-btn" href="/schueler/${sid}" title="Stammdaten bearbeiten">
           <i class="material-icons" style="font-size:14px;">edit</i> Bearbeiten
         </a>
       `;
@@ -1334,9 +1559,11 @@
 
       try {
         const kData = await StudentStore.fetchKartei(student.id);
+        if (reqId !== activeDrawerRequestId) return;
         bodyEl.innerHTML = buildKarteiCardsHtml(kData, student);
         bindKarteiNoteEvents(bodyEl, student);
       } catch (err) {
+        if (reqId !== activeDrawerRequestId) return;
         bodyEl.innerHTML = `<div style="padding:16px; color:#b3261e;">Fehler beim Laden der Kartei: ${escapeHtml(err.message)}</div>`;
       }
     }
@@ -1390,6 +1617,7 @@
 
     function renderHitsHtml(hits) {
       return hits.map(s => {
+        const sid = encodeURIComponent(String(s.id));
         const noteEntry = NotesManager.get(s.id);
         return `
         <div class="dyn-drop-item">
@@ -1407,9 +1635,9 @@
             <button type="button" class="dyn-mini-btn primary btn-open-kartei" title="Karteikarte & Notiz rechts öffnen">
               <i class="material-icons" style="font-size:13px;">contact_page</i> Kartei
             </button>
-            <a class="dyn-mini-btn" href="/schueler/${s.id}/leistungen" title="Leistungen & Stunden">Leistungen</a>
-            <a class="dyn-mini-btn accent" href="/check?mod=praxis&student=${s.id}" title="Pflichtfahrten & B197 prüfen">Praxis</a>
-            <a class="dyn-mini-btn accent" href="/check?mod=theorie&student=${s.id}" title="Theorie prüfen">Theorie</a>
+            <a class="dyn-mini-btn" href="/schueler/${sid}/leistungen" title="Leistungen & Stunden">Leistungen</a>
+            <a class="dyn-mini-btn accent" href="/check?mod=praxis&student=${sid}" title="Pflichtfahrten & B197 prüfen">Praxis</a>
+            <a class="dyn-mini-btn accent" href="/check?mod=theorie&student=${sid}" title="Theorie prüfen">Theorie</a>
           </div>
         </div>
       `;
@@ -1463,7 +1691,7 @@
 
     kBackdrop.onclick = (e) => { if (e.target === kBackdrop) kBackdrop.classList.remove('open'); };
     kBackdrop.querySelector('#dynGlobalClose').onclick = () => kBackdrop.classList.remove('open');
-    globalInput.oninput = renderGlobalResults;
+    globalInput.oninput = debounce(renderGlobalResults, 120);
     globalInactive.onchange = renderGlobalResults;
     globalInput.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') kBackdrop.classList.remove('open');
@@ -1474,6 +1702,7 @@
     });
 
     document.addEventListener('keydown', (e) => {
+      if (controlCenterActive) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         openGlobalSearch();
@@ -1591,7 +1820,7 @@
           bindResultListEvents(listEl, hits, () => dropdown.classList.remove('open'));
         }
 
-        input.oninput = updateInlineDropdown;
+        input.oninput = debounce(updateInlineDropdown, 120);
         input.onfocus = () => {
           if (StudentStore.list.length === 0) StudentStore.refresh(true);
           if (input.value.trim()) updateInlineDropdown();
@@ -1619,23 +1848,52 @@
       }
     }
 
-    const observer = new MutationObserver(() => injectDomElements());
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    let injectRafPending = false;
+    portalObserver = new MutationObserver(() => {
+      if (controlCenterActive || injectRafPending) return;
+      injectRafPending = true;
+      requestAnimationFrame(() => {
+        injectRafPending = false;
+        injectDomElements();
+      });
+    });
+    portalObserver.observe(document.documentElement, { childList: true, subtree: true });
     injectDomElements();
   }
 
   // ============================================================================
-  // ROUTE C: PRÜF-CENTER APP (/check)
+  // TEIL 4/5: PRÜF-CENTER APP (/check) — START & HTML/CSS-TEMPLATE
   // ============================================================================
   function startDynamicControlCenter() {
     controlCenterActive = true;
+
+    if (portalObserver) {
+      portalObserver.disconnect();
+      portalObserver = null;
+    }
+    if (appCleanupController) {
+      appCleanupController.abort();
+      appCleanupController = null;
+    }
+    if (appStoreListener) {
+      StudentStore.listeners.delete(appStoreListener);
+      appStoreListener = null;
+    }
+    if (appNotesListener) {
+      NotesManager.listeners.delete(appNotesListener);
+      appNotesListener = null;
+    }
+
     try { pageWin.stop(); } catch (e) {}
+    document.documentElement.classList.remove('dyn-portal-dark');
     document.documentElement.innerHTML = getAppHtml();
     CustomLogoManager.apply();
     initAppLogic(BASE_ORIGIN);
   }
 
   function getAppHtml() {
+    const logoSrc = escapeHtml(CustomLogoManager.getSrc());
+
     return `
     <head>
       <meta charset="UTF-8">
@@ -1750,6 +2008,7 @@
         .fsm-logo-head {
           display: flex;
           align-items: center;
+          justify-content: center;
           gap: 12px;
           height: 52px;
           padding: 4px 4px;
@@ -2538,8 +2797,8 @@
     <body class="mode-office">
       <!-- SIDEBAR -->
       <nav class="fsm-sidebar">
-        <a href="https://portal.fahrschulmanager.de/schueler" class="fsm-logo-head" style="justify-content:center;">
-          <img src="https://i.imgur.com/Y17StTb.png" referrerpolicy="no-referrer" alt="Logo" style="max-height:44px; max-width:100%; width:auto; height:auto; object-fit:contain; display:block;">
+        <a href="https://portal.fahrschulmanager.de/schueler" class="fsm-logo-head">
+          <img class="dyn-custom-logo-img" src="${logoSrc}" referrerpolicy="no-referrer" alt="Logo" style="max-height:44px; max-width:100%; width:auto; height:auto; object-fit:contain; display:block;">
         </a>
 
         <span class="fsm-sep"></span>
@@ -2744,9 +3003,11 @@
               <tbody id="tbody"></tbody>
               <tfoot>
                 <tr>
-                  <td colspan="6" style="display:flex; justify-content:space-between; align-items:center;">
-                    <span id="status">Lade Fahrschüler...</span>
-                    <button id="btnShowAll" type="button" class="btn btn-outline btn-sm" style="display:none;">Alle Treffer laden</button>
+                  <td colspan="6">
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                      <span id="status">Lade Fahrschüler...</span>
+                      <button id="btnShowAll" type="button" class="btn btn-outline btn-sm" style="display:none;">Alle Treffer laden</button>
+                    </div>
                   </td>
                 </tr>
               </tfoot>
@@ -2996,7 +3257,13 @@
     </body>`;
   }
 
+  // ============================================================================
+  // TEIL 5/5: PRÜF-CENTER LOGIK (THEORIE, PRAXIS/B197, DRUCK, FILTER & BATCH)
+  // ============================================================================
   function initAppLogic(baseOrigin) {
+    appCleanupController = new AbortController();
+    const uiSignal = appCleanupController.signal;
+
     let allStudents = [];
     let visibleStudents = [];
     let selectedLetter = '';
@@ -3004,7 +3271,7 @@
     let lastInspected = null;
     const theoryCache = new Map();
     const praxisCache = new Map();
-    let abortController = null;
+    let batchAbortController = null;
 
     // 1. Popup Options Menu (Potsdam-Schalter & Dark Mode)
     const rootHtml = document.documentElement;
@@ -3050,7 +3317,7 @@
       if (e.key === 'Escape' && optionsPopover.classList.contains('open')) {
         closeOptionsMenu();
       }
-    });
+    }, { signal: uiSignal });
 
     function syncPotsdamUi(enabled) {
       optPotsdamSwitch.checked = enabled;
@@ -3074,7 +3341,6 @@
       localStorage.setItem('fsm_dynamic_potsdam_mode', enabled ? 'true' : 'false');
       syncPotsdamUi(enabled);
 
-      // Alle gecachten Praxis-Zeilen in der Haupttabelle sofort aktualisieren
       praxisCache.forEach((_, sid) => updateRowBadges(sid));
 
       if (lastInspected?.praxis) {
@@ -3143,7 +3409,7 @@
 
     const urlParams = new URLSearchParams(location.search);
     const initialMod = urlParams.get('mod');
-    const initialStudentId = urlParams.get('student');
+    const initialStudentId = urlParams.get('student') ? String(urlParams.get('student')) : null;
     if (initialMod) switchActiveModule(initialMod);
 
     // 4. Password-Protected Expert Mode ("Ihsan")
@@ -3181,6 +3447,7 @@
     }
     document.getElementById('btnPwSubmit').onclick = verifyExpertPassword;
     document.getElementById('btnPwCancel').onclick = () => pwModal.classList.remove('open');
+    pwModal.onclick = (e) => { if (e.target === pwModal) pwModal.classList.remove('open'); };
     pwInput.addEventListener('keydown', (e) => {
       e.stopPropagation();
       if (e.key === 'Enter') verifyExpertPassword();
@@ -3220,50 +3487,11 @@
       return `Zusatz ${key} (Klasse B)`;
     }
 
-    function checkTwoYearValidity(isoDate) {
-      if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
-        return { status: 'missing', label: 'Datum fehlt', expiresDe: '—', daysLeft: null, isExpired: false };
-      }
-      const [y, m, d] = isoDate.split('-').map(Number);
-      const expiryDate = new Date(y + 2, m - 1, d);
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const diffMs = expiryDate.getTime() - today.getTime();
-      const daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-      const expiresDe = `${String(expiryDate.getDate()).padStart(2, '0')}.${String(expiryDate.getMonth() + 1).padStart(2, '0')}.${expiryDate.getFullYear()}`;
-
-      if (daysLeft < 0) {
-        return {
-          status: 'expired',
-          label: `Abgelaufen seit ${expiresDe} (${Math.abs(daysLeft)} T.)`,
-          expiresDe,
-          daysLeft,
-          isExpired: true
-        };
-      }
-      if (daysLeft <= 60) {
-        return {
-          status: 'expiring',
-          label: `Läuft ab am ${expiresDe} (noch ${daysLeft} T.)`,
-          expiresDe,
-          daysLeft,
-          isExpired: false
-        };
-      }
-      return {
-        status: 'valid',
-        label: `Gültig bis ${expiresDe}`,
-        expiresDe,
-        daysLeft,
-        isExpired: false
-      };
-    }
-
     function getWechslerData(studentId) {
-      if (!studentId) return { enabled: false, schoolName: '', abnDate: '', lessons: [] };
+      const sid = String(studentId || '');
+      if (!sid) return { enabled: false, schoolName: '', abnDate: '', lessons: [] };
       try {
-        const raw = localStorage.getItem(`fsm_wechsler_${studentId}`);
+        const raw = localStorage.getItem(`fsm_wechsler_${sid}`);
         if (raw) {
           const parsed = JSON.parse(raw);
           if (!Array.isArray(parsed.lessons)) {
@@ -3291,8 +3519,9 @@
     }
 
     function saveWechslerData(studentId, data) {
-      if (!studentId) return;
-      localStorage.setItem(`fsm_wechsler_${studentId}`, JSON.stringify(data));
+      const sid = String(studentId || '');
+      if (!sid) return;
+      localStorage.setItem(`fsm_wechsler_${sid}`, JSON.stringify(data));
     }
 
     function sortWechslerLessons(lessons) {
@@ -3373,7 +3602,8 @@
     isolateKeys(wechslerLessonDate);
 
     function syncWechslerUi(studentId) {
-      const wData = getWechslerData(studentId);
+      const sid = String(studentId || '');
+      const wData = getWechslerData(sid);
       chkWechsler.checked = Boolean(wData.enabled);
       wechslerPanel.classList.toggle('open', Boolean(wData.enabled));
       wechslerSchoolName.value = wData.schoolName || '';
@@ -3383,7 +3613,7 @@
         const abnVal = checkTwoYearValidity(wData.abnDate);
         const badgeCls = abnVal.status === 'expired' ? 'b-no' : (abnVal.status === 'expiring' ? 'b-warn' : 'b-yes');
         const iconPrefix = abnVal.status === 'expired' ? '❌' : (abnVal.status === 'expiring' ? '⚠️' : '✓');
-        wechslerAbnStatus.innerHTML = `<span class="fsm-badge ${badgeCls}">${iconPrefix} ABN ${abnVal.label}</span>`;
+        wechslerAbnStatus.innerHTML = `<span class="fsm-badge ${badgeCls}">${iconPrefix} ABN ${escapeHtml(abnVal.label)}</span>`;
         if (wData.enabled) {
           wechslerAbnHeaderBadge.style.display = 'inline-flex';
           wechslerAbnHeaderBadge.className = `fsm-badge ${badgeCls}`;
@@ -3461,12 +3691,12 @@
         isolateKeys(inp);
         inp.onchange = () => {
           const lid = inp.getAttribute('data-lesson-id');
-          const curData = getWechslerData(studentId);
+          const curData = getWechslerData(sid);
           const target = curData.lessons.find(x => x.id === lid);
           if (target) {
             target.date = inp.value;
-            saveWechslerData(studentId, curData);
-            syncWechslerUi(studentId);
+            saveWechslerData(sid, curData);
+            syncWechslerUi(sid);
             refreshCurrentEvaluation();
           }
         };
@@ -3475,10 +3705,10 @@
       wechslerLessonsContainer.querySelectorAll('.btn-del-wlesson').forEach(btn => {
         btn.onclick = () => {
           const lid = btn.getAttribute('data-lesson-id');
-          const curData = getWechslerData(studentId);
+          const curData = getWechslerData(sid);
           curData.lessons = curData.lessons.filter(x => x.id !== lid);
-          saveWechslerData(studentId, curData);
-          syncWechslerUi(studentId);
+          saveWechslerData(sid, curData);
+          syncWechslerUi(sid);
           refreshCurrentEvaluation();
         };
       });
@@ -3486,8 +3716,8 @@
 
     function addWechslerLessonEntry() {
       if (!lastInspected?.student?.id) return;
-      const id = lastInspected.student.id;
-      const wData = getWechslerData(id);
+      const sid = String(lastInspected.student.id);
+      const wData = getWechslerData(sid);
       const selectedKey = wechslerLessonSelect.value;
       const chosenDate = wechslerLessonDate.value || wData.abnDate || '';
 
@@ -3508,14 +3738,14 @@
         key: selectedKey,
         date: chosenDate
       });
-      saveWechslerData(id, wData);
+      saveWechslerData(sid, wData);
 
       const curIdx = ALL_WECHSLER_KEYS.indexOf(selectedKey);
       if (curIdx >= 0 && curIdx + 1 < ALL_WECHSLER_KEYS.length) {
         wechslerLessonSelect.value = ALL_WECHSLER_KEYS[curIdx + 1];
       }
 
-      syncWechslerUi(id);
+      syncWechslerUi(sid);
       refreshCurrentEvaluation();
     }
 
@@ -3529,8 +3759,8 @@
 
     document.getElementById('btnBulkFillGrund').onclick = () => {
       if (!lastInspected?.student?.id) return;
-      const id = lastInspected.student.id;
-      const wData = getWechslerData(id);
+      const sid = String(lastInspected.student.id);
+      const wData = getWechslerData(sid);
       const fillDate = wechslerLessonDate.value || wData.abnDate || '';
 
       if (!fillDate) {
@@ -3552,53 +3782,53 @@
         }
       }
       wData.enabled = true;
-      saveWechslerData(id, wData);
-      syncWechslerUi(id);
+      saveWechslerData(sid, wData);
+      syncWechslerUi(sid);
       refreshCurrentEvaluation();
     };
 
     chkWechsler.onchange = () => {
       if (!lastInspected?.student?.id) return;
-      const id = lastInspected.student.id;
-      const wData = getWechslerData(id);
+      const sid = String(lastInspected.student.id);
+      const wData = getWechslerData(sid);
       wData.enabled = chkWechsler.checked;
-      saveWechslerData(id, wData);
-      syncWechslerUi(id);
+      saveWechslerData(sid, wData);
+      syncWechslerUi(sid);
       refreshCurrentEvaluation();
     };
     wechslerSchoolName.oninput = (e) => {
       e.stopPropagation();
       if (!lastInspected?.student?.id) return;
-      const id = lastInspected.student.id;
-      const wData = getWechslerData(id);
+      const sid = String(lastInspected.student.id);
+      const wData = getWechslerData(sid);
       wData.schoolName = wechslerSchoolName.value;
-      saveWechslerData(id, wData);
+      saveWechslerData(sid, wData);
       refreshCurrentEvaluation();
     };
     wechslerAbnDate.onchange = () => {
       if (!lastInspected?.student?.id) return;
-      const id = lastInspected.student.id;
-      const wData = getWechslerData(id);
+      const sid = String(lastInspected.student.id);
+      const wData = getWechslerData(sid);
       wData.abnDate = wechslerAbnDate.value;
       if (!wechslerLessonDate.value && wechslerAbnDate.value) {
         wechslerLessonDate.value = wechslerAbnDate.value;
       }
-      saveWechslerData(id, wData);
-      syncWechslerUi(id);
+      saveWechslerData(sid, wData);
+      syncWechslerUi(sid);
       refreshCurrentEvaluation();
     };
     document.getElementById('btnClearWechsler').onclick = () => {
       if (!lastInspected?.student?.id) return;
-      const id = lastInspected.student.id;
-      const wData = getWechslerData(id);
+      const sid = String(lastInspected.student.id);
+      const wData = getWechslerData(sid);
       wData.lessons = [];
-      saveWechslerData(id, wData);
-      syncWechslerUi(id);
+      saveWechslerData(sid, wData);
+      syncWechslerUi(sid);
       refreshCurrentEvaluation();
     };
 
-    // 7. Auth & API Helpers
-    fetch(`${baseOrigin}/bff/auth/me`, { headers: API_HEADERS, credentials: 'include' })
+    // 7. Auth & Paginated API Helpers
+    fetch(`${baseOrigin}/bff/auth/me`, { headers: API_HEADERS, credentials: 'include', signal: uiSignal })
       .then(r => r.json())
       .then(me => {
         if (me.FirstName) document.getElementById('userFirst').textContent = me.FirstName;
@@ -3615,12 +3845,58 @@
       return [];
     }
 
+    async function fetchPaginatedRows(urlBuilder, signal) {
+      const pageSize = 100;
+      const maxPages = 15;
+      const allRows = [];
+      const rawPages = [];
+      let prevSignature = '';
+
+      for (let page = 1; page <= maxPages; page++) {
+        const res = await fetch(urlBuilder(page, pageSize), {
+          headers: API_HEADERS,
+          credentials: 'include',
+          signal
+        });
+        if (!res.ok) {
+          if (page === 1) return { ok: false, status: String(res.status), rows: [], raw: { error: res.status } };
+          break;
+        }
+        const raw = await res.json();
+        const rows = extractRows(raw);
+        if (rows.length === 0) {
+          if (page === 1) rawPages.push(raw);
+          break;
+        }
+
+        const sig = JSON.stringify(rows[0]);
+        if (page > 1 && sig === prevSignature) break;
+        prevSignature = sig;
+
+        rawPages.push(raw);
+        allRows.push(...rows);
+
+        const totalCount = Number(raw?.totalCount ?? raw?.total ?? raw?.pagination?.total ?? 0);
+        if (rows.length < pageSize || (totalCount > 0 && allRows.length >= totalCount)) {
+          break;
+        }
+      }
+
+      return {
+        ok: true,
+        rows: allRows,
+        raw: rawPages.length === 1 ? rawPages[0] : { pages: rawPages }
+      };
+    }
+
     // ==========================================================================
     // 8. THEORIE-PARSER & REGELWERK (§ 4 FahrschAusbO)
     // ==========================================================================
     function normalizeTheoryItem(rawItem) {
       const item = (rawItem && typeof rawItem === 'object') ? (rawItem.data || rawItem.d || rawItem) : rawItem;
-      if (!item || typeof item !== 'object') return { isoDate: '', datum: '-', zeit: '-', min: 0, units: 0, klasse: '', kapitel: '-', kapNum: null, lehrer: '-', filiale: '-', geloescht: false, isExternal: false };
+      if (!item || typeof item !== 'object') {
+        return { isoDate: '', datum: '-', zeit: '-', min: 0, units: 0, klasse: '', kapitel: '-', kapNum: null, lehrer: '-', filiale: '-', geloescht: false, isExternal: false, validity: checkTwoYearValidity('') };
+      }
       const isoMatch = String(item.datum || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
       const isoDate = isoMatch ? `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}` : '';
       const datum = isoMatch ? `${isoMatch[3]}.${isoMatch[2]}.${isoMatch[1]}` : (item.datum || '-');
@@ -3633,14 +3909,16 @@
       const kapNum = numMatch ? Number(numMatch[1]) : null;
       const lehrer = [item.fahrlehrerVorname, item.fahrlehrerNachname].filter(Boolean).join(' ').trim() || '-';
       const filiale = String(item.filiale ?? '-').trim() || '-';
-      return { isoDate, datum, zeit, min, units, klasse, kapitel, kapNum, lehrer, filiale, geloescht: Boolean(item.geloescht), isExternal: false };
+      const validity = checkTwoYearValidity(isoDate);
+      return { isoDate, datum, zeit, min, units, klasse, kapitel, kapNum, lehrer, filiale, geloescht: Boolean(item.geloescht), isExternal: false, validity };
     }
 
     function evaluateTheoryRules(theory, studentId) {
       if (!theory || !theory.ok) return null;
 
-      const extItems = buildExternalTheoryItems(studentId);
-      const wData = getWechslerData(studentId);
+      const sid = String(studentId || '');
+      const extItems = buildExternalTheoryItems(sid);
+      const wData = getWechslerData(sid);
       const allItems = [...theory.items, ...extItems];
 
       const ruleMode = document.getElementById('qRuleMode').value;
@@ -3653,38 +3931,41 @@
       const zusatzCounts = new Map();
       const zusatzExtFlags = new Map();
       const minutesByDate = new Map();
+
       let unnumberedGrundUnits = 0;
-      let oldInternalLessonCount = 0;
+      let validInternalCount = 0;
+      let validInternalMin = 0;
+      const expiredInternalItems = [];
       const expiredExternalItems = [];
       let missingDateExternalCount = 0;
 
-      const twoYearsAgo = new Date();
-      twoYearsAgo.setHours(0, 0, 0, 0);
-      twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-      const cutoffIso = `${twoYearsAgo.getFullYear()}-${String(twoYearsAgo.getMonth() + 1).padStart(2, '0')}-${String(twoYearsAgo.getDate()).padStart(2, '0')}`;
-
       for (const it of allItems) {
+        const val = it.validity || checkTwoYearValidity(it.isoDate);
+        if (val.isExpired) {
+          if (it.isExternal) expiredExternalItems.push(it);
+          else expiredInternalItems.push(it);
+          continue;
+        }
+
         if (it.isoDate) {
           minutesByDate.set(it.isoDate, (minutesByDate.get(it.isoDate) || 0) + it.min);
         }
 
-        const isExpired = Boolean(it.isoDate && it.isoDate < cutoffIso);
-        if (isExpired) {
-          if (it.isExternal) {
-            expiredExternalItems.push(it);
-            continue;
-          } else {
-            oldInternalLessonCount++;
-          }
-        }
-
-        if (it.isExternal && !it.isoDate) {
+        if (!it.isExternal) {
+          validInternalCount++;
+          validInternalMin += it.min;
+        } else if (!it.isoDate) {
           missingDateExternalCount++;
         }
 
         const isZusatz = Boolean(it.klasse) || (it.kapNum !== null && it.kapNum >= 13);
         if (isZusatz) {
-          const zKey = it.kapNum !== null ? `${it.klasse || 'Zusatz'}-${it.kapNum}` : `${it.klasse || 'Zusatz'}-${it.kapitel}`;
+          // Kapitel 13/14 und B-1/B-2 einheitlich abbilden, um Doppelzählung bei Wechslern zu verhindern
+          const normZNum = (it.kapNum !== null && it.kapNum >= 13 && it.kapNum <= 14)
+            ? it.kapNum - 12
+            : it.kapNum;
+          const clsLabel = (it.klasse || 'Zusatz').toUpperCase();
+          const zKey = normZNum !== null ? `${clsLabel}-${normZNum}` : `${clsLabel}-${it.kapitel}`;
           zusatzCounts.set(zKey, (zusatzCounts.get(zKey) || 0) + it.units);
           if (it.isExternal) zusatzExtFlags.set(zKey, true);
         } else if (it.kapNum !== null && it.kapNum >= 1 && it.kapNum <= 12) {
@@ -3740,17 +4021,20 @@
         const expDesc = expiredExternalItems.map(x => `${x.kapitel.split('(')[0].trim()} (${x.datum})`).join(', ');
         reasons.push(`❌ Abgelaufene Fremdstunden (> 2 Jahre gem. § 4 Abs. 6 FahrschAusbO — nicht anrechenbar): ${expDesc}.`);
       }
+      if (expiredInternalItems.length > 0) {
+        reasons.push(`⚠️ Hinweis: ${expiredInternalItems.length} eigene Unterrichtseinheit(en) sind älter als 2 Jahre (§ 4 Abs. 6 FahrschAusbO) und wurden nicht gewertet.`);
+      }
       if (missingDateExternalCount > 0) {
         reasons.push(`⚠️ Bei ${missingDateExternalCount} eingetragener Fremdstunde(n) fehlt das Unterrichtsdatum zur Fristprüfung.`);
       }
       if (effectiveGrundUnits < reqGrund) {
         reasons.push(`Grundstoff unvollständig: ${effectiveGrundUnits} von ${reqGrund} DS angerechnet (Fehlende Lektionen: ${missingGrundChapters.join(', ')}; genutzte Dopplungen: ${usableDoubles}/${maxDoublesAllowed}).`);
-      }
-      if (doubledChapters.length > maxDoublesAllowed && ruleMode === 'ersterwerb') {
-        reasons.push(`Zu viele Dopplungen im Grundstoff (Lektion ${doubledChapters.join(', ')}) — max. 2 Lektionen aus 1–12 dürfen doppelt angerechnet werden.`);
-      }
-      if (overRepeatedChapters.length > 0) {
-        reasons.push(`Lektion ${overRepeatedChapters.join(', ')} wurde 3× oder häufiger besucht (max. 2× anrechenbar).`);
+        if (doubledChapters.length > maxDoublesAllowed && ruleMode === 'ersterwerb') {
+          reasons.push(`Zu viele Dopplungen im Grundstoff (Lektion ${doubledChapters.join(', ')}) — max. 2 Lektionen aus 1–12 dürfen doppelt angerechnet werden.`);
+        }
+        if (overRepeatedChapters.length > 0) {
+          reasons.push(`Lektion ${overRepeatedChapters.join(', ')} wurde 3× oder häufiger besucht (max. 2× anrechenbar).`);
+        }
       }
       if (effectiveZusatzUnits < reqZusatz) {
         reasons.push(`Klassenspezifischer Zusatzstoff unvollständig: ${effectiveZusatzUnits} von ${reqZusatz} Themen (B-1 und B-2 sind beide Pflicht).`);
@@ -3758,23 +4042,19 @@
       if (dailyViolations.length > 0) {
         reasons.push(`Tageslimit überschritten (§ 4 Abs. 1 FahrschAusbO erlaubt max. 180 Min./Tag): ${dailyViolations.join(', ')}.`);
       }
-      if (oldInternalLessonCount > 0) {
-        reasons.push(`${oldInternalLessonCount} eigene Unterrichtseinheit(en) überschreiten die 2-Jahres-Frist (§ 4 Abs. 6 FahrschAusbO).`);
-      }
 
       const allowed = effectiveGrundUnits >= reqGrund
         && effectiveZusatzUnits >= reqZusatz
         && dailyViolations.length === 0
-        && oldInternalLessonCount === 0
         && expiredExternalItems.length === 0
         && !isAbnExpired;
 
-      const totalCombinedMin = theory.totalMin + validExtCount * 90;
+      const totalCombinedMin = validInternalMin + validExtCount * 90;
 
       if (allowed) {
         reasons.push(`Grundstoff erfüllt: ${effectiveGrundUnits}/${reqGrund} DS (${uniqueGrundChapters} Themen${usableDoubles ? `, inkl. ${usableDoubles} zulässiger Dopplung: Lektion ${doubledChapters.slice(0, usableDoubles).join(', ')}` : ''}).`);
         reasons.push(`Zusatzstoff erfüllt: ${effectiveZusatzUnits}/${reqZusatz} klassenspezifische Themen vollständig.`);
-        reasons.push(`Anrechenbare Gesamtzeit: ${totalCombinedMin} Min. (${theory.items.length + validExtCount} gültige Termine) — konform gemäß § 4 FahrschAusbO.`);
+        reasons.push(`Anrechenbare Gesamtzeit: ${totalCombinedMin} Min. (${validInternalCount + validExtCount} gültige Termine) — konform gemäß § 4 FahrschAusbO.`);
       }
 
       return {
@@ -3793,7 +4073,8 @@
         extCount: extItems.length,
         validExtCount,
         expiredExtCount: expiredExternalItems.length,
-        internalCount: theory.items.length,
+        expiredInternalCount: expiredInternalItems.length,
+        internalCount: validInternalCount,
         totalCombinedMin,
         wechslerSchool: wData.schoolName.trim() || 'Fremdfahrschule',
         wechslerAbnDate: wData.abnDate ? formatGermanDate(wData.abnDate) : ''
@@ -3801,34 +4082,53 @@
     }
 
     async function fetchTheoryOnly(id, signal, force = false) {
-      if (!force && theoryCache.has(id)) return theoryCache.get(id);
-      const url = `${baseOrigin}/bff/api/v2/theoriestunden/kunde/${encodeURIComponent(id)}?skipDeleted=true&pagination.page=1&pagination.pageSize=100&pagination.count=100`;
-      const res = await fetch(url, { headers: API_HEADERS, credentials: 'include', signal });
-      if (!res.ok) {
-        const errObj = { ok: false, error: `HTTP ${res.status}`, items: [], raw: { error: res.status } };
-        theoryCache.set(id, errObj);
+      const sid = String(id ?? '');
+      if (!force && theoryCache.has(sid)) return theoryCache.get(sid);
+
+      const pageRes = await fetchPaginatedRows(
+        (page, pageSize) => `${baseOrigin}/bff/api/v2/theoriestunden/kunde/${encodeURIComponent(sid)}?skipDeleted=true&pagination.page=${page}&pagination.pageSize=${pageSize}&pagination.count=${pageSize}`,
+        signal
+      );
+
+      if (!pageRes.ok) {
+        const errObj = { ok: false, error: `HTTP ${pageRes.status}`, items: [], raw: pageRes.raw };
+        theoryCache.set(sid, errObj);
         return errObj;
       }
-      const raw = await res.json();
-      const items = extractRows(raw).map(normalizeTheoryItem).filter(it => !it.geloescht);
+
+      const items = pageRes.rows.map(normalizeTheoryItem).filter(it => !it.geloescht);
       let totalMin = 0, grundCount = 0, klasseCount = 0;
       for (const it of items) {
         totalMin += it.min;
         if (it.klasse || (it.kapNum !== null && it.kapNum >= 13)) klasseCount++;
         else grundCount++;
       }
-      const result = { ok: true, raw, items, totalMin, grundCount, klasseCount };
-      theoryCache.set(id, result);
+      const result = { ok: true, raw: pageRes.raw, items, totalMin, grundCount, klasseCount };
+      theoryCache.set(sid, result);
       return result;
     }
 
     // ==========================================================================
     // 9. PRAXIS & PFLICHTFAHRTEN-ANALYSE ENGINE
     // ==========================================================================
+    function classifyPraxisType(artStr) {
+      const aLower = String(artStr || '').toLowerCase();
+      if (aLower.includes('überland') || aLower.includes('ueberland')) return 'ueberland';
+      if (aLower.includes('autobahn')) return 'autobahn';
+      if (aLower.includes('nacht') || aLower.includes('beleuchtung') || aLower.includes('dämmerung') || aLower.includes('daemmerung')) return 'nacht';
+      if (aLower.includes('197') || aLower.includes('testfahrt')) return 'testfahrt197';
+      if (aLower.includes('prüfung') || aLower.includes('pruefung')) return 'pruefung';
+      return 'uebung';
+    }
+
+    function isSonderType(pType) {
+      return pType === 'ueberland' || pType === 'autobahn' || pType === 'nacht';
+    }
+
     function normalizePraxisItem(rawItem) {
       const item = (rawItem && typeof rawItem === 'object') ? (rawItem.data || rawItem.d || rawItem) : rawItem;
       if (!item || typeof item !== 'object') {
-        return { isoDate: '', sortTs: 0, datum: '-', startTime: '', zeit: '-', min: 0, kfz: '-', lehrer: '-', klasse: 'B', art: '-', bemerkung: '', betrag: 0, inhalt: '', hasGf: false, geloescht: false };
+        return { isoDate: '', sortTs: 0, datum: '-', startTime: '', zeit: '-', min: 0, kfz: '-', lehrer: '-', klasse: 'B', art: '-', pType: 'uebung', bemerkung: '', betrag: 0, inhalt: '', hasGf: false, geloescht: false };
       }
 
       const rawDate = String(pickProp(item, 'datum', 'terminDatum', 'date', 'start') || '');
@@ -3866,6 +4166,7 @@
 
       const klasse = String(pickProp(item, 'klasse', 'klassen', 'fuehrerscheinklasse') ?? 'B').trim();
       const art = String(pickProp(item, 'art', 'leistungsart', 'fahrstundenArt', 'bezeichnung', 'typ', 'leistungsBezeichnung') ?? 'Übungsfahrt').trim();
+      const pType = classifyPraxisType(art);
       const bemerkung = String(pickProp(item, 'bemerkung', 'kommentar', 'notiz', 'hinweis') ?? '').trim();
       const betrag = Number(pickProp(item, 'betrag', 'preis', 'summe', 'brutto') ?? 0) || 0;
 
@@ -3892,6 +4193,7 @@
         lehrer,
         klasse,
         art,
+        pType,
         bemerkung,
         betrag,
         inhalt: inhalt || (hasGf ? '/Gf.' : ''),
@@ -3901,43 +4203,44 @@
     }
 
     async function fetchPraxisOnly(id, signal, force = false) {
-      if (!force && praxisCache.has(id)) return praxisCache.get(id);
+      const sid = String(id ?? '');
+      if (!force && praxisCache.has(sid)) return praxisCache.get(sid);
 
-      const candidateUrls = [
-        `${baseOrigin}/bff/api/v2/fahrstunden/kunde/${encodeURIComponent(id)}?skipDeleted=true&pagination.page=1&pagination.pageSize=100&pagination.count=100`,
-        `${baseOrigin}/bff/api/v1/fahrstunden/kunde/${encodeURIComponent(id)}?skipDeleted=true&pagination.page=1&pagination.pageSize=100&pagination.count=100`,
-        `${baseOrigin}/bff/api/v3/fahrstunden/kunde/${encodeURIComponent(id)}?skipDeleted=true&pagination.page=1&pagination.pageSize=100&pagination.count=100`
+      const candidateBuilders = [
+        (page, size) => `${baseOrigin}/bff/api/v2/fahrstunden/kunde/${encodeURIComponent(sid)}?skipDeleted=true&pagination.page=${page}&pagination.pageSize=${size}&pagination.count=${size}`,
+        (page, size) => `${baseOrigin}/bff/api/v1/fahrstunden/kunde/${encodeURIComponent(sid)}?skipDeleted=true&pagination.page=${page}&pagination.pageSize=${size}&pagination.count=${size}`,
+        (page, size) => `${baseOrigin}/bff/api/v3/fahrstunden/kunde/${encodeURIComponent(sid)}?skipDeleted=true&pagination.page=${page}&pagination.pageSize=${size}&pagination.count=${size}`
       ];
 
-      let raw = null;
+      let pageRes = null;
       let lastStatus = '404';
 
-      for (const url of candidateUrls) {
+      for (const builder of candidateBuilders) {
         try {
-          const res = await fetch(url, { headers: API_HEADERS, credentials: 'include', signal });
-          if (res.ok) {
-            raw = await res.json();
+          const attempt = await fetchPaginatedRows(builder, signal);
+          if (attempt.ok) {
+            pageRes = attempt;
             break;
           }
-          lastStatus = String(res.status);
+          lastStatus = attempt.status;
         } catch (e) {
           if (e.name === 'AbortError') throw e;
           lastStatus = e.message;
         }
       }
 
-      if (!raw) {
+      if (!pageRes) {
         const errObj = { ok: false, error: `HTTP ${lastStatus}`, items: [], raw: { error: lastStatus } };
-        praxisCache.set(id, errObj);
+        praxisCache.set(sid, errObj);
         return errObj;
       }
 
-      const items = extractRows(raw).map(normalizePraxisItem).filter(it => !it.geloescht);
+      const items = pageRes.rows.map(normalizePraxisItem).filter(it => !it.geloescht);
       const totalMin = items.reduce((acc, it) => acc + it.min, 0);
       const totalBetrag = items.reduce((acc, it) => acc + it.betrag, 0);
 
-      const result = { ok: true, raw, items, totalMin, totalBetrag };
-      praxisCache.set(id, result);
+      const result = { ok: true, raw: pageRes.raw, items, totalMin, totalBetrag };
+      praxisCache.set(sid, result);
       return result;
     }
 
@@ -3947,7 +4250,7 @@
 
       const kB197 = Boolean(pickProp(kartei, 'b197')) || Boolean(pickProp(kartei, 'b197Testfahrt'));
       const classHas197 = (student?._klassenStr || '').includes('197');
-      const hasTestfahrtLesson = (praxis?.items || []).some(it => /197/i.test(it.art));
+      const hasTestfahrtLesson = (praxis?.items || []).some(it => it.pType === 'testfahrt197');
       const isB197 = kB197 || classHas197 || hasTestfahrtLesson;
 
       return {
@@ -3974,22 +4277,27 @@
       const sonderfahrtenAll = [];
 
       for (const it of chronItems) {
-        const aLower = it.art.toLowerCase();
-        if (aLower.includes('überland') || aLower.includes('ueberland')) {
-          ueberlandList.push(it);
-          sonderfahrtenAll.push(it);
-        } else if (aLower.includes('autobahn')) {
-          autobahnList.push(it);
-          sonderfahrtenAll.push(it);
-        } else if (aLower.includes('nacht') || aLower.includes('beleuchtung') || aLower.includes('dämmerung')) {
-          nachtList.push(it);
-          sonderfahrtenAll.push(it);
-        } else if (aLower.includes('197') || aLower.includes('testfahrt')) {
-          testfahrtB197List.push(it);
-        } else if (aLower.includes('prüfung') || aLower.includes('pruefung')) {
-          pruefungsList.push(it);
-        } else {
-          uebungsfahrten.push(it);
+        switch (it.pType) {
+          case 'ueberland':
+            ueberlandList.push(it);
+            sonderfahrtenAll.push(it);
+            break;
+          case 'autobahn':
+            autobahnList.push(it);
+            sonderfahrtenAll.push(it);
+            break;
+          case 'nacht':
+            nachtList.push(it);
+            sonderfahrtenAll.push(it);
+            break;
+          case 'testfahrt197':
+            testfahrtB197List.push(it);
+            break;
+          case 'pruefung':
+            pruefungsList.push(it);
+            break;
+          default:
+            uebungsfahrten.push(it);
         }
       }
 
@@ -4031,12 +4339,13 @@
 
       // 3. GRUNDFAHRAUFGABEN (/Gf.) & CHRONOLOGIE-VERBOT NACH SONDERFAHRT
       const gfLessons = chronItems.filter(x => x.hasGf);
-      const firstSonderfahrt = sonderfahrtenAll.length > 0 ? sonderfahrtenAll[0] : null;
+      const datedSonderfahrten = sonderfahrtenAll.filter(x => x.sortTs > 0);
+      const firstSonderfahrt = datedSonderfahrten.length > 0 ? datedSonderfahrten[0] : (sonderfahrtenAll[0] || null);
 
       const gfAfterSonderViolations = [];
       if (firstSonderfahrt && firstSonderfahrt.sortTs > 0) {
         for (const gf of gfLessons) {
-          if (gf.sortTs > firstSonderfahrt.sortTs) {
+          if (gf.sortTs > 0 && gf.sortTs > firstSonderfahrt.sortTs) {
             gfAfterSonderViolations.push({
               gfLesson: gf,
               sonderLesson: firstSonderfahrt
@@ -4128,7 +4437,7 @@
         cardsGrid.style.display = 'none';
         pFoot.style.display = 'none';
         btnPrintPraxis.style.display = 'none';
-        verdictBox.innerHTML = `<div class="verdict-box no"><div class="verdict-headline">Fehler beim Laden der Fahrstunden (${praxis?.error || 'Unbekannt'})</div></div>`;
+        verdictBox.innerHTML = `<div class="verdict-box no"><div class="verdict-headline">Fehler beim Laden der Fahrstunden (${escapeHtml(praxis?.error || 'Unbekannt')})</div></div>`;
         pBody.innerHTML = `<tr><td colspan="11" style="color:var(--err-solid);">Keine Fahrstunden-Antwort vom Server erhalten.</td></tr>`;
         return;
       }
@@ -4149,7 +4458,7 @@
               ${ev.allowed ? '✓ JA — PFLICHTFAHRTEN & CHRONOLOGIE KORREKT' : '✕ NICHT ZUGELASSEN — FEHLER BEI PFLICHTFAHRTEN'}
             </div>
             <ul class="verdict-reasons">
-              ${ev.reasons.map(r => `<li>${r}</li>`).join('')}
+              ${ev.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('')}
             </ul>
           </div>
           <div class="verdict-stats">
@@ -4177,6 +4486,14 @@
       const abAnAbfBadgeHtml = ev.potsdamMode
         ? `<span class="fsm-badge b-ext">✓ Frei (Filiale Potsdam)</span>`
         : `<span class="fsm-badge ${ev.abAnAbfahrtOk ? 'b-yes' : 'b-no'}">${ev.twentyMinOnAbDate.length}× am AB-Tag (${ev.twentyMinDrives.length}× ges.)</span>`;
+
+      const kfzSummary = ev.schaltKfzSet.size ? escapeHtml(Array.from(ev.schaltKfzSet).join(', ')) : '—';
+      const firstSonderSummary = ev.firstSonderfahrt
+        ? escapeHtml(`${ev.firstSonderfahrt.datum} (${ev.firstSonderfahrt.art})`)
+        : 'Noch keine';
+      const pruefSummary = ev.pruefungsList.length
+        ? escapeHtml(`${ev.pruefungsList.length}× (${ev.pruefungsList.map(p => p.bemerkung || p.datum).join(', ')})`)
+        : '—';
 
       cardsGrid.style.display = 'grid';
       cardsGrid.innerHTML = `
@@ -4222,7 +4539,7 @@
           </div>
           <div class="pcheck-item">
             <span>Erkanntes Schalt-KFZ</span>
-            <span style="font-weight:600;">${ev.schaltKfzSet.size ? Array.from(ev.schaltKfzSet).join(', ') : '—'}</span>
+            <span style="font-weight:600;">${kfzSummary}</span>
           </div>
         </div>
 
@@ -4237,7 +4554,7 @@
           </div>
           <div class="pcheck-item">
             <span>1. Sonderfahrt (Stichtag)</span>
-            <span style="font-weight:600;">${ev.firstSonderfahrt ? `${ev.firstSonderfahrt.datum} (${ev.firstSonderfahrt.art})` : 'Noch keine'}</span>
+            <span style="font-weight:600;">${firstSonderSummary}</span>
           </div>
           <div class="pcheck-item">
             <span>/Gf. nach Sonderfahrt?</span>
@@ -4247,14 +4564,14 @@
           </div>
           <div class="pcheck-item">
             <span>Prüfungsfahrt(en)</span>
-            <span style="font-weight:600;">${ev.pruefungsList.length ? `${ev.pruefungsList.length}× (${ev.pruefungsList.map(p => p.bemerkung || p.datum).join(', ')})` : '—'}</span>
+            <span style="font-weight:600;">${pruefSummary}</span>
           </div>
         </div>
       `;
 
       const violationSet = new Set(ev.gfAfterSonderViolations.map(v => v.gfLesson));
       const abDates = new Set(
-        praxis.items.filter(x => x.art.toLowerCase().includes('autobahn')).map(x => x.isoDate)
+        praxis.items.filter(x => x.pType === 'autobahn').map(x => x.isoDate).filter(Boolean)
       );
 
       if (praxis.items.length === 0) {
@@ -4268,9 +4585,8 @@
 
         pBody.innerHTML = praxis.items.map(it => {
           const isViolation = violationSet.has(it);
-          const aLower = it.art.toLowerCase();
-          const isSonder = aLower.includes('überland') || aLower.includes('ueberland') || aLower.includes('autobahn') || aLower.includes('nacht');
-          const isTest197 = aLower.includes('197');
+          const isSonder = isSonderType(it.pType);
+          const isTest197 = it.pType === 'testfahrt197';
           const isAnAbfahrt20 = !ev.potsdamMode && !isSonder && it.min === 20 && abDates.has(it.isoDate);
           const isB197Schalt90 = !isSonder && it.min === 90 && ev.schaltKfzSet.has(it.kfz);
 
@@ -4324,10 +4640,11 @@
     };
 
     function renderKarteiModuleTab(student, k) {
+      const sid = encodeURIComponent(String(student.id));
       document.getElementById('karteiTabTitle').textContent = `3. Schüler-Kartei & Büro-Notizen: ${student._nachname}, ${student._vorname} (${student._karteiNr || '—'})`;
       document.getElementById('karteiTabLinks').innerHTML = `
-        <a class="btn btn-outline btn-sm" style="background:#fff; color:#00394d;" href="${baseOrigin}/schueler/${student.id}/leistungen" target="_blank">Leistungen öffnen ↗</a>
-        <a class="btn btn-outline btn-sm" style="background:#fff; color:#00394d;" href="${baseOrigin}/schueler/${student.id}" target="_blank">Stammdaten bearbeiten ↗</a>
+        <a class="btn btn-outline btn-sm" style="background:#fff; color:#00394d;" href="${baseOrigin}/schueler/${sid}/leistungen" target="_blank">Leistungen öffnen ↗</a>
+        <a class="btn btn-outline btn-sm" style="background:#fff; color:#00394d;" href="${baseOrigin}/schueler/${sid}" target="_blank">Stammdaten bearbeiten ↗</a>
       `;
       const tabBody = document.getElementById('karteiTabBody');
       tabBody.innerHTML = `<div class="kartei-grid">${buildKarteiCardsHtml(k, student)}</div>`;
@@ -4335,30 +4652,31 @@
     }
 
     function updateRowBadges(studentId) {
-      const rowEl = document.getElementById(`row-${studentId}`);
+      const sid = String(studentId || '');
+      const rowEl = document.getElementById(`row-${sid}`);
       if (!rowEl) return;
-      const th = theoryCache.get(studentId);
-      const pr = praxisCache.get(studentId);
-      const studentObj = allStudents.find(s => s.id === studentId);
+      const th = theoryCache.get(sid);
+      const pr = praxisCache.get(sid);
+      const studentObj = allStudents.find(s => s.id === sid);
 
       const nameCell = rowEl.querySelector('.student-name-cell');
       if (nameCell && studentObj) {
-        nameCell.innerHTML = `${escapeHtml(studentObj._nachname)}, ${escapeHtml(studentObj._vorname)}${NotesManager.badgeHtml(studentId)}`;
+        nameCell.innerHTML = `${escapeHtml(studentObj._nachname)}, ${escapeHtml(studentObj._vorname)}${NotesManager.badgeHtml(sid)}`;
       }
 
       if (th && th.ok) {
-        const evT = evaluateTheoryRules(th, studentId);
+        const evT = evaluateTheoryRules(th, sid);
         rowEl.querySelector('.verdict-theory-cell').innerHTML = evT && evT.allowed
           ? `<span class="fsm-badge b-yes">✓ THEORIE OK</span>`
           : `<span class="fsm-badge b-no">✕ THEORIE FEHLT</span>`;
       }
       if (pr && pr.ok) {
         let erwerbMode, b197Mode;
-        if (lastInspected?.student?.id === studentId) {
+        if (lastInspected?.student?.id === sid) {
           erwerbMode = document.getElementById('praxisErwerbMode').value;
           b197Mode = document.getElementById('praxisB197Mode').value;
         } else {
-          const detected = autoDetectPraxisConfig(studentObj, StudentStore.karteiMap.get(studentId), pr);
+          const detected = autoDetectPraxisConfig(studentObj, StudentStore.karteiMap.get(sid), pr);
           erwerbMode = detected.erwerbMode;
           b197Mode = detected.b197Mode;
         }
@@ -4369,11 +4687,12 @@
       }
     }
 
-    NotesManager.listeners.add(() => {
+    appNotesListener = () => {
       if (lastInspected?.student?.id) {
         updateRowBadges(lastInspected.student.id);
       }
-    });
+    };
+    NotesManager.listeners.add(appNotesListener);
 
     function refreshCurrentEvaluation() {
       if (!lastInspected) return;
@@ -4383,7 +4702,7 @@
     }
 
     function renderTheoryDetails(student, label, theory, praxis, kartei) {
-      const studentId = student?.id || '';
+      const studentId = String(student?.id || '');
       const evalTheory = evaluateTheoryRules(theory, studentId);
 
       if (!lastInspected || lastInspected.student?.id !== studentId) {
@@ -4427,7 +4746,7 @@
       const tBody = document.getElementById('theoryBody');
 
       if (!theory || !theory.ok) {
-        verdictBox.innerHTML = `<div class="verdict-box no"><div class="verdict-headline">Abruffehler (${theory?.error})</div></div>`;
+        verdictBox.innerHTML = `<div class="verdict-box no"><div class="verdict-headline">Abruffehler (${escapeHtml(theory?.error || 'Unbekannt')})</div></div>`;
         fileNoticeBox.style.display = 'none';
         btnPrintTheory.style.display = 'none';
         matrixEl.innerHTML = '';
@@ -4443,7 +4762,7 @@
               ${evalTheory.allowed ? '✓ JA — ZUR THEORIEPRÜFUNG ZUGELASSEN' : '✕ NICHT ZUGELASSEN'}
             </div>
             <ul class="verdict-reasons">
-              ${evalTheory.reasons.map(r => `<li>${r}</li>`).join('')}
+              ${evalTheory.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('')}
             </ul>
           </div>
           <div class="verdict-stats">
@@ -4484,7 +4803,7 @@
       else {
         for (const [k, cnt] of zEntries) {
           const isExt = evalTheory.zusatzExtFlags.get(k);
-          pills.push(`<span class="m-pill ${isExt ? 'm-ext' : 'm-done'}">${k} (${cnt}×) ✓${isExt ? ' [Wechsler]' : ''}</span>`);
+          pills.push(`<span class="m-pill ${isExt ? 'm-ext' : 'm-done'}">${escapeHtml(k)} (${cnt}×) ✓${isExt ? ' [Wechsler]' : ''}</span>`);
         }
         if (zEntries.length < 2) pills.push(`<span class="m-pill m-miss">2. Zusatzthema fehlt</span>`);
       }
@@ -4493,11 +4812,13 @@
       tBody.innerHTML = evalTheory.allItems.length === 0
         ? `<tr><td colspan="7" style="color:var(--text-muted);">Keine Theoriestunden erfasst.</td></tr>`
         : evalTheory.allItems.map(t => {
-            const isExtExpired = Boolean(t.isExternal && t.validity?.isExpired);
-            const rowCls = isExtExpired ? 'row-violation' : (t.isExternal ? 'row-external' : '');
+            const isExpired = Boolean(t.validity?.isExpired);
+            const rowCls = isExpired ? 'row-violation' : (t.isExternal ? 'row-external' : '');
             const filialeHtml = t.isExternal
-              ? `<span class="fsm-badge ${isExtExpired ? 'b-no' : 'b-ext'}">${isExtExpired ? '❌ ABGELAUFEN · ' : ''}${escapeHtml(t.filiale)}</span>`
-              : escapeHtml(t.filiale);
+              ? `<span class="fsm-badge ${isExpired ? 'b-no' : 'b-ext'}">${isExpired ? '❌ ABGELAUFEN · ' : ''}${escapeHtml(t.filiale)}</span>`
+              : (isExpired
+                  ? `<span class="fsm-badge b-no">❌ Abgelaufen (>2 J.)</span> ${escapeHtml(t.filiale)}`
+                  : escapeHtml(t.filiale));
             return `
               <tr class="${rowCls}">
                 <td>${escapeHtml(t.datum)}</td>
@@ -4525,7 +4846,8 @@
         const isExt = evalTheory.grundExtFlags.get(ch);
         checklistHtml.push(`L${ch}: <strong>${cnt > 0 ? cnt + '×' + (isExt ? ' (Wechsler)' : '') : 'fehlt'}</strong>`);
       }
-      const zEntries = Array.from(evalTheory.zusatzCounts.entries()).map(([k, c]) => `${k}: <strong>${c}×${evalTheory.zusatzExtFlags.get(k) ? ' (Wechsler)' : ''}</strong>`);
+      const zEntries = Array.from(evalTheory.zusatzCounts.entries())
+        .map(([k, c]) => `${escapeHtml(k)}: <strong>${c}×${evalTheory.zusatzExtFlags.get(k) ? ' (Wechsler)' : ''}</strong>`);
       const abnPrintInfo = evalTheory.wechslerAbnDate ? ` · ABN vom ${escapeHtml(evalTheory.wechslerAbnDate)}` : '';
 
       document.getElementById('printSheet').innerHTML = `
@@ -4535,7 +4857,7 @@
             <div style="font-size:18px; font-weight:700;">PRÜFBERICHT THEORIE-ZULASSUNG (§ 4 FahrschAusbO)</div>
           </div>
           <div style="text-align:right; font-size:11.5px;">
-            <div><strong>Datum / Uhrzeit:</strong> ${nowStr} Uhr</div>
+            <div><strong>Datum / Uhrzeit:</strong> ${escapeHtml(nowStr)} Uhr</div>
             <div><strong>Geprüft durch:</strong> ${escapeHtml(workerName)}</div>
           </div>
         </div>
@@ -4560,7 +4882,7 @@
             ERGEBNIS: ${evalTheory.allowed ? 'JA — ZUR THEORIEPRÜFUNG ZUGELASSEN' : 'NEIN — NICHT ZUR THEORIEPRÜFUNG ZUGELASSEN'}
           </div>
           <ul style="margin:6px 0 0; padding-left:18px; font-size:11px;">
-            ${evalTheory.reasons.map(r => `<li>${r}</li>`).join('')}
+            ${evalTheory.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('')}
           </ul>
         </div>
         <div style="font-size:10.5px; margin-bottom:10px; padding:6px 10px; border:1px solid #ccc;">
@@ -4571,7 +4893,7 @@
           <thead><tr><th>Nr.</th><th>Datum</th><th>Zeit</th><th>Minuten</th><th>Klasse</th><th>Kapitel</th><th>Fahrlehrer / Vor-Fahrschule</th><th>Filiale / Nachweis</th></tr></thead>
           <tbody>
             ${evalTheory.allItems.map((t, idx) => `
-              <tr><td>${idx + 1}</td><td>${escapeHtml(t.datum)}</td><td>${escapeHtml(t.zeit)}</td><td>${t.min}</td><td>${escapeHtml(t.klasse || 'Grund')}</td><td>${escapeHtml(t.kapitel)}</td><td>${escapeHtml(t.lehrer)}</td><td>${escapeHtml(t.filiale)}</td></tr>
+              <tr><td>${idx + 1}</td><td>${escapeHtml(t.datum)}</td><td>${escapeHtml(t.zeit)}</td><td>${t.min}</td><td>${escapeHtml(t.klasse || 'Grund')}</td><td>${escapeHtml(t.kapitel)}</td><td>${escapeHtml(t.lehrer)}</td><td>${escapeHtml(t.filiale)}${t.validity?.isExpired ? ' [ABGELAUFEN]' : ''}</td></tr>
             `).join('')}
           </tbody>
         </table>
@@ -4600,7 +4922,7 @@
             <div style="font-size:18px; font-weight:700;">PRÜFBERICHT PRAXIS & PFLICHTFAHRTEN</div>
           </div>
           <div style="text-align:right; font-size:11.5px;">
-            <div><strong>Datum / Uhrzeit:</strong> ${nowStr} Uhr</div>
+            <div><strong>Datum / Uhrzeit:</strong> ${escapeHtml(nowStr)} Uhr</div>
             <div><strong>Geprüft durch:</strong> ${escapeHtml(workerName)}</div>
           </div>
         </div>
@@ -4621,12 +4943,12 @@
           </div>
           <div style="margin-top:4px; font-size:11.5px; font-weight:600;">
             Überland: ${evalPraxis.uelMin}/225m  |
-            Autobahn: ${abPrintStr}  |
+            Autobahn: ${escapeHtml(abPrintStr)}  |
             Nacht: ${evalPraxis.nfMin}/135m  |
             B197: ${evalPraxis.ninetyMinDrives.length}×90m + Testfahrt: ${evalPraxis.testfahrt15.length}×
           </div>
           <ul style="margin:6px 0 0; padding-left:18px; font-size:11px;">
-            ${evalPraxis.reasons.map(r => `<li>${r}</li>`).join('')}
+            ${evalPraxis.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('')}
           </ul>
         </div>
         <table class="p-table">
@@ -4662,7 +4984,8 @@
       if (!s || !s.id) return;
       if (targetTab !== 'dokumente' && !skipWorkerRequirement && !requireWorkerName()) return;
 
-      const tr = document.getElementById(`row-${s.id}`);
+      const sid = String(s.id);
+      const tr = document.getElementById(`row-${sid}`);
       if (tr) {
         document.querySelectorAll('#tbody tr.selected').forEach(el => el.classList.remove('selected'));
         tr.classList.add('selected');
@@ -4672,15 +4995,15 @@
 
       try {
         const [kFetched, theory, praxis] = await Promise.all([
-          StudentStore.fetchKartei(s.id).catch(e => ({ error: e.message })),
-          fetchTheoryOnly(s.id),
-          fetchPraxisOnly(s.id)
+          StudentStore.fetchKartei(sid).catch(e => ({ error: e.message })),
+          fetchTheoryOnly(sid, uiSignal),
+          fetchPraxisOnly(sid, uiSignal)
         ]);
 
         renderTheoryDetails(s, `${s._nachname}, ${s._vorname}`, theory, praxis, kFetched);
-        updateRowBadges(s.id);
+        updateRowBadges(sid);
       } catch (err) {
-        console.error('[Dynamic Inspect Error]', err);
+        if (err?.name !== 'AbortError') console.error('[Dynamic Inspect Error]', err);
       } finally {
         if (tr) {
           const btn = tr.querySelector('.btn-inspect');
@@ -4694,7 +5017,8 @@
     async function applyFilters(resetLimit = true) {
       if (resetLimit) renderLimit = 150;
       const rawText = document.getElementById('qText').value || '';
-      const queryTokens = rawText.toLowerCase().trim().split(/[\s,.\-_()/]+/).filter(Boolean);
+      const trimmedText = rawText.trim();
+      const queryTokens = trimmedText.toLowerCase().split(/[\s,.\-_()/]+/).filter(Boolean);
       const matchMode = document.getElementById('qMatchMode').value;
       const classQuery = (document.getElementById('qKlasse').value || '').toLowerCase().trim();
 
@@ -4707,8 +5031,13 @@
         return true;
       });
 
-      if (visibleStudents.length === 0 && rawText.trim().length >= 2 && fallbackCheckDoneForQuery !== rawText.trim()) {
-        fallbackCheckDoneForQuery = rawText.trim();
+      if (
+        visibleStudents.length === 0 &&
+        trimmedText.length >= 2 &&
+        fallbackCheckDoneForQuery !== trimmedText &&
+        Date.now() - StudentStore.lastFetch > 10000
+      ) {
+        fallbackCheckDoneForQuery = trimmedText;
         await loadStudentsFromServer(true);
         return;
       }
@@ -4719,20 +5048,21 @@
       const frag = document.createDocumentFragment();
 
       for (const s of slice) {
+        const sid = String(s.id);
         const tr = document.createElement('tr');
-        tr.id = `row-${s.id}`;
-        if (lastInspected?.student?.id === s.id) tr.classList.add('selected');
+        tr.id = `row-${sid}`;
+        if (lastInspected?.student?.id === sid) tr.classList.add('selected');
 
-        const cachedTheory = theoryCache.get(s.id);
-        const cachedEvalT = cachedTheory ? evaluateTheoryRules(cachedTheory, s.id) : null;
+        const cachedTheory = theoryCache.get(sid);
+        const cachedEvalT = cachedTheory ? evaluateTheoryRules(cachedTheory, sid) : null;
         const theoryHtml = !cachedTheory
           ? `<span class="fsm-badge b-open">Ungeprüft</span>`
           : (cachedEvalT && cachedEvalT.allowed
               ? `<span class="fsm-badge b-yes">✓ THEORIE OK</span>`
               : `<span class="fsm-badge b-no">✕ THEORIE FEHLT</span>`);
 
-        const cachedPraxis = praxisCache.get(s.id);
-        const detectedCfg = autoDetectPraxisConfig(s, StudentStore.karteiMap.get(s.id), cachedPraxis);
+        const cachedPraxis = praxisCache.get(sid);
+        const detectedCfg = autoDetectPraxisConfig(s, StudentStore.karteiMap.get(sid), cachedPraxis);
         const cachedEvalP = cachedPraxis ? evaluatePraxisRules(cachedPraxis, detectedCfg.erwerbMode, detectedCfg.b197Mode, isPotsdamMode()) : null;
         const praxisHtml = !cachedPraxis
           ? `<span class="fsm-badge b-open">Ungeprüft</span>`
@@ -4742,7 +5072,7 @@
 
         tr.innerHTML = `
           <td>${escapeHtml(s._karteiNr || '—')}</td>
-          <td class="student-name-cell" style="font-weight:500;">${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}${NotesManager.badgeHtml(s.id)}</td>
+          <td class="student-name-cell" style="font-weight:500;">${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}${NotesManager.badgeHtml(sid)}</td>
           <td>${escapeHtml(s._klassenStr || '—')}</td>
           <td class="verdict-theory-cell">${theoryHtml}</td>
           <td class="verdict-praxis-cell">${praxisHtml}</td>
@@ -4785,22 +5115,24 @@
       status.textContent = 'Synchronisiere Fahrschüler...';
       const incInactive = document.getElementById('qActive').value === 'false';
 
-      // Google-Sheet-Notizen im Hintergrund synchronisieren (blockiert NIEMALS das Laden der Schülerliste!)
-      NotesManager.syncAll(force).then(() => {
-        if (visibleStudents.length > 0) applyFilters(false);
+      // Google-Sheet-Notizen im Hintergrund synchronisieren (blockiert nicht das Laden der Schülerliste)
+      NotesManager.syncAll(force).then((changed) => {
+        if (changed && visibleStudents.length > 0) applyFilters(false);
       });
 
       allStudents = await StudentStore.refresh(force, incInactive);
       await applyFilters(true);
     }
 
-    StudentStore.listeners.add((updatedList) => {
+    appStoreListener = (updatedList) => {
       allStudents = updatedList;
       applyFilters(false);
-    });
+    };
+    StudentStore.listeners.add(appStoreListener);
 
-    document.getElementById('qText').addEventListener('input', () => applyFilters(true));
-    document.getElementById('qKlasse').addEventListener('input', () => applyFilters(true));
+    const debouncedFilter = debounce(() => applyFilters(true), 150);
+    document.getElementById('qText').addEventListener('input', debouncedFilter);
+    document.getElementById('qKlasse').addEventListener('input', debouncedFilter);
     document.getElementById('qMatchMode').addEventListener('change', () => applyFilters(true));
     document.getElementById('qRuleMode').addEventListener('change', () => {
       applyFilters(true);
@@ -4812,41 +5144,58 @@
       document.getElementById('qText').value = '';
       document.getElementById('qKlasse').value = '';
       selectedLetter = '';
+      fallbackCheckDoneForQuery = '';
       alphabetBar.querySelectorAll('.char-btn').forEach((el, idx) => el.classList.toggle('selected', idx === 0));
       applyFilters(true);
     };
-    document.getElementById('btnReloadList').onclick = () => loadStudentsFromServer(true);
+    document.getElementById('btnReloadList').onclick = () => {
+      theoryCache.clear();
+      praxisCache.clear();
+      StudentStore.karteiMap.clear();
+      loadStudentsFromServer(true);
+    };
     document.getElementById('qActive').onchange = () => loadStudentsFromServer(true);
 
     document.getElementById('btnBatch').onclick = async () => {
       if (!requireWorkerName()) return;
       const targets = [...visibleStudents];
-      abortController = new AbortController();
+      if (targets.length === 0) return;
+
+      batchAbortController = new AbortController();
       const btnBatch = document.getElementById('btnBatch');
       const btnStop = document.getElementById('btnStop');
       btnBatch.disabled = true;
       btnStop.style.display = 'inline-flex';
-      btnStop.onclick = () => abortController.abort();
+      btnStop.onclick = () => batchAbortController?.abort();
 
-      let index = 0, completed = 0;
+      let index = 0;
+      let completed = 0;
+
       async function worker() {
-        while (index < targets.length && !abortController.signal.aborted) {
+        while (index < targets.length && !batchAbortController.signal.aborted) {
           const s = targets[index++];
           try {
             await Promise.all([
               StudentStore.fetchKartei(s.id).catch(() => null),
-              fetchTheoryOnly(s.id, abortController.signal),
-              fetchPraxisOnly(s.id, abortController.signal)
+              fetchTheoryOnly(s.id, batchAbortController.signal),
+              fetchPraxisOnly(s.id, batchAbortController.signal)
             ]);
             updateRowBadges(s.id);
-          } catch (e) { if (e.name === 'AbortError') break; }
+          } catch (e) {
+            if (e?.name === 'AbortError') break;
+          }
           completed++;
           document.getElementById('status').textContent = `Prüfe Theorie & Praxis: ${completed} / ${targets.length}`;
         }
       }
-      await Promise.all(Array.from({ length: 6 }, () => worker()));
-      btnBatch.disabled = false;
-      btnStop.style.display = 'none';
+
+      try {
+        await Promise.all(Array.from({ length: 6 }, () => worker()));
+      } finally {
+        btnBatch.disabled = visibleStudents.length === 0;
+        btnStop.style.display = 'none';
+        batchAbortController = null;
+      }
     };
 
     loadStudentsFromServer(true).then(() => {
