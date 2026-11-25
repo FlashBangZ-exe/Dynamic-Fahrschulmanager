@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Fahrschule Dynamic – Prüf-Center (Theorie, Praxis/Pflichtfahrten, Blitzsuche & GSheet-Notizen)
+// @name         Fahrschule Dynamic – Prüf-Center & Tracking Suite (Theorie, Praxis, Blitzsuche & GSheet-Sync)
 // @namespace    https://portal.fahrschulmanager.de/
-// @version      5.9.1
-// @description  Vollständige Theorie- & Pflichtfahrten-Analyse (inkl. Optionen-Menü mit Potsdam-Schalter & Dark Mode auf Hauptseite & Prüf-Center, Fahrschulwechsler ABN-Prüfung, B197, Sonderfahrten), Blitzsuche, Kartei & Google-Sheets-Notizen
+// @version      6.2.4
+// @description  Theorie- & Pflichtfahrten-Analyse (Potsdam-Schalter, Dark Mode, Wechsler ABN-Prüfung, B197), Blitzsuche, Kartei, Büro-Notizen & 3-Bereiche Schüler-Tracking Suite mit automatischem Kartei-Anmeldedatum, Nicht-zugeordnet-Liste, dynamischem Filial-Filter & Google-Sheets-Sync
 // @match        https://portal.fahrschulmanager.de/*
 // @updateURL    https://raw.githubusercontent.com/FlashBangZ-exe/Dynamic-Fahrschulmanager/main/FSM-Hijack.user.js
 // @downloadURL  https://raw.githubusercontent.com/FlashBangZ-exe/Dynamic-Fahrschulmanager/main/FSM-Hijack.user.js
@@ -23,7 +23,7 @@
   'use strict';
 
   // ============================================================================
-  // TEIL 1/5: KONSTANTEN, STORAGE, HILFSFUNKTIONEN, LOGO- & NOTIZEN-MANAGER
+  // TEIL 1/5: KONSTANTEN, STORAGE, HILFSFUNKTIONEN, LOGO-, NOTIZEN- & TRACKING-MANAGER
   // ============================================================================
   const BASE_ORIGIN = 'https://portal.fahrschulmanager.de';
   const CUSTOM_LOGO_URL = 'https://i.imgur.com/Y17StTb.png';
@@ -33,13 +33,15 @@
   const pageWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   // Optional: Google Apps Script Web-App URL ("https://script.google.com/macros/s/.../exec")
-  const DEFAULT_GSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxipfwTClq-xrxSjxzs5sTiYaH--syRgB0jo9_Uo78utq_CzOHOTFHDlAYqi6XnO7rmGg/exec';
+  const DEFAULT_GSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyaop8N9yhCm6_jPl-WFBKuY8yaV87wO5p1ep2RpNn7zRczzFLptvSGGp1DdbBueM--/exec';
+  const PREVIOUS_GSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxipfwTClq-xrxSjxzs5sTiYaH--syRgB0jo9_Uo78utq_CzOHOTFHDlAYqi6XnO7rmGg/exec';
 
   let controlCenterActive = false;
   let portalObserver = null;
   let appCleanupController = null;
   let appStoreListener = null;
   let appNotesListener = null;
+  let appTrackingListener = null;
 
   const DynStorage = (() => {
     const nativeLS = window.localStorage;
@@ -144,6 +146,24 @@
     return undefined;
   }
 
+  function normalizeIsoDate(val) {
+    if (!val) return '';
+    const str = String(val).trim();
+    const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    const dmy = str.match(/^(\d{2})\.(\d{2})\.(\d{4})/);
+    if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+    return '';
+  }
+
+  function getTodayIso() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
   function formatGermanDate(val, withAge = false) {
     if (!val) return '—';
     const str = String(val).trim();
@@ -166,6 +186,170 @@
     const rounded = Math.round(num * 10) / 10;
     return String(rounded).replace('.', ',');
   }
+
+  // Dynamische Filial-Erkennung aus der Kartei-Nr. (z. B. "PS1234" -> "PS", "KWS 7692" -> "KWS")
+  function extractBranchCode(karteiNr) {
+    const str = String(karteiNr || '').trim();
+    const m = str.match(/^([A-Za-zÄÖÜäöüß]+)/);
+    return m ? m[1].toUpperCase() : '';
+  }
+
+  // Extrahiert das Anmeldedatum zuverlässig aus FSM-Kartei- oder Schülerdaten (inkl. ausbildungen[])
+  function extractRegistrationDate(obj, fallbackBirthIso = '') {
+    if (!obj || typeof obj !== 'object') return '';
+
+    const birthIso = fallbackBirthIso || normalizeIsoDate(pickProp(obj, 'geburtsdatum', 'birthDate', 'gebDatum'));
+    const maxYear = new Date().getFullYear() + 1;
+
+    const isValidRegDate = (rawVal) => {
+      const iso = normalizeIsoDate(rawVal);
+      if (!iso) return '';
+      if (birthIso && iso === birthIso) return '';
+      const year = Number(iso.slice(0, 4));
+      if (year < 1995 || year > maxYear) return '';
+      return iso;
+    };
+
+    const EXPLICIT_KEYS = [
+      'anmeldedatum', 'anmelde_datum', 'anmeldeDatum',
+      'anmeldung', 'anmeldungDatum', 'anmeldung_datum',
+      'vertragsdatum', 'vertrags_datum', 'vertragDatum',
+      'vertragsbeginn', 'vertrags_beginn', 'ausbildungsvertragDatum',
+      'eintrittsdatum', 'eintritts_datum', 'eintritt',
+      'ausbildungsbeginn', 'ausbildungs_beginn',
+      'aufnahmedatum', 'registrierungsdatum', 'startdatum',
+      'erstelltAm', 'erstellt_am', 'angelegtAm', 'angelegt_am', 'createdAt'
+    ];
+
+    const scanObject = (target, allowGenericDatum = false) => {
+      if (!target || typeof target !== 'object') return '';
+
+      for (let i = 0; i < EXPLICIT_KEYS.length; i++) {
+        const val = pickProp(target, EXPLICIT_KEYS[i]);
+        const iso = isValidRegDate(val);
+        if (iso) return iso;
+      }
+
+      if (allowGenericDatum) {
+        const genericIso = isValidRegDate(pickProp(target, 'beginn', 'start', 'datum'));
+        if (genericIso) return genericIso;
+      }
+
+      // Dynamischer Fallback-Scan für abweichende FSM-Feldnamen (Geburtstag/Prüfung/Ablauf ausgeschlossen)
+      const entries = Object.entries(target);
+      for (let i = 0; i < entries.length; i++) {
+        const [k, v] = entries[i];
+        if (typeof v !== 'string') continue;
+        if (/geburt|birth|ruecklauf|pruef|ablauf|ende|stop|gueltig|update|aender|modif|letzte|last|sehtest|hilfe|antrag|ausweis|pass|bis$/i.test(k)) {
+          continue;
+        }
+        if (/anmeld|vertrag|eintritt|beginn|registrier|aufnahme|erstell|angeleg|created/i.test(k)) {
+          const iso = isValidRegDate(v);
+          if (iso) return iso;
+        }
+      }
+      return '';
+    };
+
+    // 1. Direkt auf dem Hauptobjekt prüfen
+    const topHit = scanObject(obj, false);
+    if (topHit) return topHit;
+
+    // 2. Verschachtelte Unterobjekte prüfen (z. B. stammdaten / schueler / kunde)
+    const nestedObjs = [obj.stammdaten, obj.schueler, obj.kunde, obj.vertrag];
+    for (let i = 0; i < nestedObjs.length; i++) {
+      const hit = scanObject(nestedObjs[i], false);
+      if (hit) return hit;
+    }
+
+    // 3. Ausbildungen-Array prüfen (im FSM liegt das Anmelde-/Vertragsdatum häufig pro Ausbildung)
+    if (Array.isArray(obj.ausbildungen)) {
+      for (let i = 0; i < obj.ausbildungen.length; i++) {
+        const hit = scanObject(obj.ausbildungen[i], true);
+        if (hit) return hit;
+      }
+    }
+
+    return '';
+  }
+
+  // Persistenter Cache für bereits aus der Kartei gelesene Anmeldedaten (schont den FSM-Server)
+  const RegDateCache = {
+    STORAGE_KEY: 'fsm_dyn_regdate_cache',
+    TTL_FOUND_MS: 14 * 24 * 60 * 60 * 1000, // 14 Tage für gefundene Daten
+    TTL_EMPTY_MS: 6 * 60 * 60 * 1000,       // 6 Stunden für leere Ergebnisse
+    map: new Map(),
+    saveTimer: null,
+
+    init() {
+      try {
+        const raw = DynStorage.getItem(this.STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          Object.entries(parsed).forEach(([sid, entry]) => {
+            if (entry && typeof entry === 'object') {
+              this.map.set(String(sid), {
+                date: normalizeIsoDate(entry.date),
+                ts: Number(entry.ts) || 0
+              });
+            }
+          });
+        }
+      } catch (e) {}
+    },
+
+    scheduleSave() {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = setTimeout(() => {
+        try {
+          const obj = {};
+          this.map.forEach((v, k) => { obj[k] = v; });
+          DynStorage.setItem(this.STORAGE_KEY, JSON.stringify(obj));
+        } catch (e) {}
+      }, 400);
+    },
+
+    getEntry(studentId) {
+      const sid = String(studentId || '').trim();
+      if (!sid) return null;
+      const entry = this.map.get(sid);
+      if (!entry) return null;
+      const ttl = entry.date ? this.TTL_FOUND_MS : this.TTL_EMPTY_MS;
+      if (Date.now() - entry.ts > ttl) {
+        this.map.delete(sid);
+        return null;
+      }
+      return entry;
+    },
+
+    getDate(studentId) {
+      const entry = this.getEntry(studentId);
+      return entry ? entry.date : '';
+    },
+
+    set(studentId, isoDate) {
+      const sid = String(studentId || '').trim();
+      if (!sid) return;
+      const clean = normalizeIsoDate(isoDate);
+      const prev = this.map.get(sid);
+      // Bestehendes gefundenes Datum nicht versehentlich mit leerem String überschreiben
+      if (!clean && prev && prev.date) return;
+      this.map.set(sid, { date: clean, ts: Date.now() });
+      this.scheduleSave();
+    },
+
+    clearEmpty() {
+      let changed = false;
+      this.map.forEach((v, k) => {
+        if (!v.date) {
+          this.map.delete(k);
+          changed = true;
+        }
+      });
+      if (changed) this.scheduleSave();
+    }
+  };
 
   // Zentrale 2-Jahres-Fristprüfung (§ 4 Abs. 6 FahrschAusbO) für interne & Wechsler-Stunden
   function checkTwoYearValidity(isoDate) {
@@ -206,6 +390,43 @@
       expiresDe,
       daysLeft,
       isExpired: false
+    };
+  }
+
+  // 2-Jahres-Vertragsprüfung für die Schüler-Tracking Suite (> 2 Jahre = Vertrag abgelaufen -> ROT)
+  function checkRegistrationExpiry(isoDate) {
+    const clean = normalizeIsoDate(isoDate);
+    if (!clean) {
+      return { status: 'none', isExpired: false, isExpiring: false, label: '', expiresDe: '—', daysLeft: null };
+    }
+    const res = checkTwoYearValidity(clean);
+    if (res.status === 'expired') {
+      return {
+        status: 'expired',
+        isExpired: true,
+        isExpiring: false,
+        label: `Vertrag >2 J. (abgelaufen am ${res.expiresDe})`,
+        expiresDe: res.expiresDe,
+        daysLeft: res.daysLeft
+      };
+    }
+    if (res.status === 'expiring') {
+      return {
+        status: 'expiring',
+        isExpired: false,
+        isExpiring: true,
+        label: `Noch ${res.daysLeft} T. (bis ${res.expiresDe})`,
+        expiresDe: res.expiresDe,
+        daysLeft: res.daysLeft
+      };
+    }
+    return {
+      status: 'valid',
+      isExpired: false,
+      isExpiring: false,
+      label: `Gültig bis ${res.expiresDe}`,
+      expiresDe: res.expiresDe,
+      daysLeft: res.daysLeft
     };
   }
 
@@ -285,7 +506,7 @@
   } catch (e) {}
 
   // ============================================================================
-  // 0. CUSTOM LOGO MANAGER & GOOGLE SHEETS NOTIZEN-MANAGER
+  // 0. CUSTOM LOGO MANAGER, NOTIZEN-MANAGER & SCHÜLER-TRACKING-MANAGER
   // ============================================================================
   const CustomLogoManager = {
     dataUrl: CUSTOM_LOGO_URL,
@@ -365,7 +586,6 @@
       const src = this.getSrc();
       if (!src) return;
 
-      // 1. Dynamisches Stylesheet für CSS-basierte Logos (nutzt gecachte Data-URL gegen CSP-Blocker)
       if (document.head) {
         let logoStyle = document.getElementById('dyn-custom-logo-style');
         if (!logoStyle) {
@@ -388,7 +608,6 @@
         `;
       }
 
-      // 2. Alle <img>-Elemente (Hauptseite & /check) direkt aktualisieren
       document.querySelectorAll('app-navbar img[src*="fsmlogo"], nav.main-menu img[src*="fsmlogo"], img[src*="fsmlogo"], img.dyn-custom-logo-img').forEach(img => {
         img.classList.add('dyn-custom-logo-img');
         if (img.getAttribute('src') !== src) {
@@ -401,7 +620,6 @@
         img.style.width = 'auto';
       });
 
-      // 3. Falls Angular das Logo als CSS background-image rendert (gezielt nur auf Logo-Containern)
       document.querySelectorAll('app-navbar a, app-navbar div, nav.main-menu a, nav.main-menu div').forEach(el => {
         if (el.dataset.dynBgLogoApplied === '1') return;
         const bg = getComputedStyle(el).backgroundImage;
@@ -450,7 +668,12 @@
     },
 
     getEndpoint() {
-      return (DynStorage.getItem('fsm_dyn_gscript_url') || DEFAULT_GSCRIPT_URL || '').trim();
+      const stored = (DynStorage.getItem('fsm_dyn_gscript_url') || '').trim();
+      if (stored && stored === PREVIOUS_GSCRIPT_URL) {
+        DynStorage.removeItem('fsm_dyn_gscript_url');
+        return (DEFAULT_GSCRIPT_URL || '').trim();
+      }
+      return (stored || DEFAULT_GSCRIPT_URL || '').trim();
     },
 
     setEndpoint(url) {
@@ -470,6 +693,20 @@
       return `<span class="dyn-note-indicator ${isWarn ? 'warn' : ''}" title="${escapeHtml(entry.note)}">${isWarn ? '⚠️' : '📝'} Notiz</span>`;
     },
 
+    applyEntries(entries) {
+      if (this.pendingSaves > 0 || !Array.isArray(entries)) return false;
+      this.map.clear();
+      entries.forEach(e => {
+        if (e && e.studentId && e.note) {
+          this.map.set(String(e.studentId), e);
+        }
+      });
+      this.lastSync = Date.now();
+      this.saveCache();
+      this.notify();
+      return true;
+    },
+
     async syncAll(force = false) {
       const url = this.getEndpoint();
       if (!url || !url.startsWith('https://script.google.com')) return false;
@@ -479,22 +716,18 @@
       this.isSyncing = true;
       try {
         const sep = url.includes('?') ? '&' : '?';
-        const data = await externalRequestJson(`${url}${sep}t=${Date.now()}`, {
+        const data = await externalRequestJson(`${url}${sep}type=all&t=${Date.now()}`, {
           method: 'GET',
-          timeout: 10000
+          timeout: 12000
         });
-        if (this.pendingSaves === 0 && data && Array.isArray(data.entries)) {
-          this.map.clear();
-          data.entries.forEach(e => {
-            if (e && e.studentId && e.note) {
-              this.map.set(String(e.studentId), e);
-            }
-          });
-          this.lastSync = Date.now();
-          this.saveCache();
-          this.notify();
-          return true;
+        let changed = false;
+        if (data && Array.isArray(data.entries)) {
+          changed = this.applyEntries(data.entries) || changed;
         }
+        if (data && typeof data === 'object') {
+          TrackingManager.applyServerPayload(data);
+        }
+        return changed;
       } catch (e) {
         console.warn('[Dynamic Notes] Sync-Fehler:', e);
       } finally {
@@ -533,6 +766,7 @@
       }
 
       const payload = {
+        action: 'saveNote',
         studentId: sid,
         karteiNr: localEntry.karteiNr,
         name: localEntry.name,
@@ -567,15 +801,416 @@
     }
   };
 
+  // ============================================================================
+  // TRACKING MANAGER (3 BEREICHE + DYNAMISCHE FILIALEN + ARCHIV-ABGLEICH)
+  // ============================================================================
+  const TrackingManager = {
+    STAGES: {
+      new: { key: 'new', label: 'Neue Schüler', short: 'Neu', icon: '🆕', cls: 'trk-new' },
+      driving: { key: 'driving', label: 'Bereits am Fahren', short: 'Fährt', icon: '🚗', cls: 'trk-driving' },
+      stopped: { key: 'stopped', label: 'Prozess abgebrochen', short: 'Abgebrochen', icon: '🛑', cls: 'trk-stopped' }
+    },
+    map: new Map(),
+    branches: new Map(),
+    listeners: new Set(),
+    lastSync: 0,
+    isSyncing: false,
+    pendingSaves: 0,
+    lastArchiveReconcile: 0,
+    backendStatus: 'unknown', // 'unknown' | 'ok' | 'outdated'
+
+    init() {
+      try {
+        const raw = DynStorage.getItem('fsm_dyn_tracking_cache');
+        if (raw) {
+          const obj = JSON.parse(raw);
+          Object.entries(obj).forEach(([k, v]) => {
+            if (v && v.studentId && this.STAGES[v.stage]) {
+              this.map.set(String(k), this.normalizeEntry(v));
+            }
+          });
+        }
+      } catch (e) {}
+
+      try {
+        const rawBr = DynStorage.getItem('fsm_dyn_branches_cache');
+        if (rawBr) {
+          const arr = JSON.parse(rawBr);
+          if (Array.isArray(arr)) {
+            arr.forEach(b => {
+              if (b && b.code) this.branches.set(String(b.code).toUpperCase(), String(b.label || b.code));
+            });
+          }
+        }
+      } catch (e) {}
+    },
+
+    normalizeEntry(e) {
+      const karteiNr = String(e.karteiNr || '').trim();
+      const branch = String(e.branch || '').trim().toUpperCase() || extractBranchCode(karteiNr);
+      return {
+        studentId: String(e.studentId || '').trim(),
+        karteiNr,
+        branch,
+        name: String(e.name || '').trim(),
+        klassen: String(e.klassen || '').trim(),
+        stage: String(e.stage || '').trim().toLowerCase(),
+        registrationDate: normalizeIsoDate(e.registrationDate),
+        stoppedDrivingDate: normalizeIsoDate(e.stoppedDrivingDate),
+        processStoppedDate: normalizeIsoDate(e.processStoppedDate),
+        notes: String(e.notes || '').trim(),
+        isArchived: Boolean(e.isArchived),
+        updatedBy: String(e.updatedBy || '').trim(),
+        updatedAt: String(e.updatedAt || '').trim()
+      };
+    },
+
+    saveCache() {
+      try {
+        const obj = {};
+        this.map.forEach((v, k) => { obj[k] = v; });
+        DynStorage.setItem('fsm_dyn_tracking_cache', JSON.stringify(obj));
+
+        const brArr = [];
+        this.branches.forEach((label, code) => brArr.push({ code, label }));
+        DynStorage.setItem('fsm_dyn_branches_cache', JSON.stringify(brArr));
+      } catch (e) {}
+    },
+
+    notify() {
+      this.listeners.forEach(fn => {
+        try { fn(); } catch (e) {}
+      });
+    },
+
+    getEndpoint() {
+      return NotesManager.getEndpoint();
+    },
+
+    getSelectedBranch() {
+      return (DynStorage.getItem('fsm_dyn_trk_branch') || 'ALL').toUpperCase();
+    },
+
+    setSelectedBranch(code) {
+      const clean = String(code || 'ALL').trim().toUpperCase() || 'ALL';
+      DynStorage.setItem('fsm_dyn_trk_branch', clean);
+    },
+
+    getBranchLabel(code) {
+      const clean = String(code || '').trim().toUpperCase();
+      if (!clean) return 'Ohne Kürzel';
+      const full = this.branches.get(clean);
+      if (full && full.toUpperCase() !== clean) return `${clean} · ${full}`;
+      return clean;
+    },
+
+    // Sammelt alle Filial-Kürzel dynamisch aus Google Sheet ("Filialen"), Tracking-Einträgen & FSM-Schülern
+    getAllBranches(studentsList = []) {
+      const merged = new Map();
+      this.branches.forEach((label, code) => {
+        if (code && code !== 'ALLE') merged.set(code, label || code);
+      });
+      this.map.forEach(entry => {
+        const c = entry.branch || extractBranchCode(entry.karteiNr);
+        if (c && !merged.has(c)) merged.set(c, c);
+      });
+      if (Array.isArray(studentsList)) {
+        for (let i = 0; i < studentsList.length; i++) {
+          const c = studentsList[i]?._branch || extractBranchCode(studentsList[i]?._karteiNr);
+          if (c && !merged.has(c)) merged.set(c, c);
+        }
+      }
+      return Array.from(merged.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([code, label]) => ({ code, label }));
+    },
+
+    get(studentId) {
+      const entry = this.map.get(String(studentId)) || null;
+      return (entry && this.STAGES[entry.stage]) ? entry : null;
+    },
+
+    getAll() {
+      return Array.from(this.map.values()).filter(e => e && this.STAGES[e.stage]);
+    },
+
+    badgeHtml(studentId) {
+      const entry = this.get(studentId);
+      if (!entry) return '';
+      const st = this.STAGES[entry.stage];
+      if (!st) return '';
+
+      const exp = checkRegistrationExpiry(entry.registrationDate);
+      const parts = [];
+      const tipParts = [`Tracking: ${st.label}`];
+      if (entry.registrationDate) tipParts.push(`Anmeldung: ${formatGermanDate(entry.registrationDate)}`);
+      if (entry.stoppedDrivingDate) tipParts.push(`Fahren gestoppt: ${formatGermanDate(entry.stoppedDrivingDate)}`);
+      if (entry.processStoppedDate) tipParts.push(`Abgebrochen: ${formatGermanDate(entry.processStoppedDate)}`);
+      if (entry.notes) tipParts.push(`Notiz: ${entry.notes}`);
+
+      parts.push(`<span class="dyn-trk-pill ${st.cls}" title="${escapeHtml(tipParts.join(' · '))}">${st.icon} ${st.short}</span>`);
+      if (exp.isExpired) {
+        parts.push(`<span class="dyn-trk-pill trk-expired" title="${escapeHtml(exp.label)}">⚠️ &gt;2 J.</span>`);
+      }
+      if (entry.isArchived) {
+        parts.push(`<span class="dyn-trk-pill trk-archived" title="Im Fahrschulmanager inaktiv / archiviert">📦 Archiv</span>`);
+      }
+      return parts.join('');
+    },
+
+    applyServerPayload(data) {
+      if (!data || typeof data !== 'object') return false;
+      if (Array.isArray(data.branches)) {
+        data.branches.forEach(b => {
+          if (b && b.code) {
+            this.branches.set(String(b.code).trim().toUpperCase(), String(b.label || b.code).trim());
+          }
+        });
+      }
+      if (Array.isArray(data.tracking)) {
+        this.backendStatus = 'ok';
+        if (this.pendingSaves === 0) {
+          this.map.clear();
+          data.tracking.forEach(raw => {
+            const norm = this.normalizeEntry(raw);
+            if (norm.studentId && this.STAGES[norm.stage]) {
+              this.map.set(norm.studentId, norm);
+            }
+          });
+          this.lastSync = Date.now();
+          this.saveCache();
+          this.notify();
+          return true;
+        }
+      } else if (data.ok !== false && Array.isArray(data.entries)) {
+        // Alte Google-Apps-Script-Version (liefert nur Notizen, aber kein "tracking"-Array)
+        const prevStatus = this.backendStatus;
+        this.backendStatus = 'outdated';
+        if (prevStatus !== 'outdated') this.notify();
+      }
+      this.saveCache();
+      return false;
+    },
+
+    async syncAll(force = false) {
+      const url = this.getEndpoint();
+      if (!url || !url.startsWith('https://script.google.com')) return false;
+      if (this.isSyncing || this.pendingSaves > 0) return false;
+      if (!force && Date.now() - this.lastSync < 20000) return false;
+
+      this.isSyncing = true;
+      try {
+        const sep = url.includes('?') ? '&' : '?';
+        const data = await externalRequestJson(`${url}${sep}type=all&t=${Date.now()}`, {
+          method: 'GET',
+          timeout: 12000
+        });
+        if (data && Array.isArray(data.entries)) {
+          NotesManager.applyEntries(data.entries);
+        }
+        return this.applyServerPayload(data);
+      } catch (e) {
+        console.warn('[Dynamic Tracking] Sync-Fehler:', e);
+      } finally {
+        this.isSyncing = false;
+      }
+      return false;
+    },
+
+    async save(studentOrEntry, patch = {}) {
+      const sid = String(studentOrEntry?.id || studentOrEntry?.studentId || '').trim();
+      if (!sid) throw new Error('Ungültige Schüler-ID');
+
+      const existing = this.get(sid);
+      const stage = String(patch.stage || existing?.stage || 'new').trim().toLowerCase();
+      if (!this.STAGES[stage]) throw new Error(`Ungültiger Tracking-Bereich: ${stage}`);
+
+      const karteiNr = String(
+        patch.karteiNr ?? studentOrEntry?._karteiNr ?? studentOrEntry?.karteiNr ?? existing?.karteiNr ?? ''
+      ).trim();
+      const branch = String(
+        patch.branch ?? studentOrEntry?._branch ?? existing?.branch ?? extractBranchCode(karteiNr)
+      ).trim().toUpperCase() || extractBranchCode(karteiNr);
+
+      const builtName = studentOrEntry?._nachname !== undefined
+        ? `${studentOrEntry._nachname || ''}, ${studentOrEntry._vorname || ''}`.replace(/^,\s*|,\s*$/g, '').trim()
+        : '';
+      const name = String(patch.name ?? (builtName || studentOrEntry?.name || existing?.name || '')).trim();
+      const klassen = String(
+        patch.klassen ?? studentOrEntry?._klassenStr ?? studentOrEntry?.klassen ?? existing?.klassen ?? ''
+      ).trim();
+
+      const registrationDate = normalizeIsoDate(
+        patch.registrationDate !== undefined ? patch.registrationDate : (existing?.registrationDate || '')
+      );
+      const stoppedDrivingDate = normalizeIsoDate(
+        patch.stoppedDrivingDate !== undefined ? patch.stoppedDrivingDate : (existing?.stoppedDrivingDate || '')
+      );
+      let processStoppedDate = normalizeIsoDate(
+        patch.processStoppedDate !== undefined ? patch.processStoppedDate : (existing?.processStoppedDate || '')
+      );
+      if (stage === 'stopped' && !processStoppedDate) {
+        processStoppedDate = getTodayIso();
+      }
+
+      const notes = String(patch.notes !== undefined ? patch.notes : (existing?.notes || '')).trim();
+      const defaultArchived = studentOrEntry?._isActive === false ? true : Boolean(existing?.isArchived);
+      const isArchived = patch.isArchived !== undefined ? Boolean(patch.isArchived) : defaultArchived;
+      const author = DynStorage.getItem('fsm_dynamic_worker_name') || 'Büro';
+      const nowStr = new Date().toLocaleString('de-DE', {
+        day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
+      });
+
+      const localEntry = this.normalizeEntry({
+        studentId: sid,
+        karteiNr,
+        branch,
+        name,
+        klassen,
+        stage,
+        registrationDate,
+        stoppedDrivingDate,
+        processStoppedDate,
+        notes,
+        isArchived,
+        updatedBy: author,
+        updatedAt: nowStr
+      });
+
+      this.map.set(sid, localEntry);
+      if (branch && !this.branches.has(branch)) {
+        this.branches.set(branch, branch);
+      }
+      this.saveCache();
+      this.notify();
+
+      const url = this.getEndpoint();
+      if (!url || !url.startsWith('https://script.google.com')) {
+        return { ...localEntry, localOnly: true };
+      }
+
+      this.pendingSaves++;
+      try {
+        const data = await externalRequestJson(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'saveTracking',
+            ...localEntry
+          }),
+          timeout: 12000
+        });
+
+        if (!data || !data.ok) {
+          throw new Error(data?.error || 'Google Sheet hat das Tracking-Speichern abgelehnt.');
+        }
+
+        const returnedStage = String(data?.entry?.stage || '').trim().toLowerCase();
+        if (!returnedStage || !this.STAGES[returnedStage]) {
+          // Schutz vor alter Apps-Script-Version: lokalen Bereich (stage) niemals überschreiben!
+          this.backendStatus = 'outdated';
+          this.map.set(sid, localEntry);
+          this.saveCache();
+          this.notify();
+          return { ...localEntry, localOnly: true, outdatedBackend: true };
+        }
+
+        this.backendStatus = 'ok';
+        if (Array.isArray(data.branches)) {
+          data.branches.forEach(b => {
+            if (b && b.code) this.branches.set(String(b.code).toUpperCase(), String(b.label || b.code));
+          });
+        }
+
+        const finalEntry = this.normalizeEntry({ ...localEntry, ...data.entry });
+        this.map.set(sid, finalEntry);
+        this.saveCache();
+        this.notify();
+        return finalEntry;
+      } finally {
+        this.pendingSaves = Math.max(0, this.pendingSaves - 1);
+      }
+    },
+
+    async remove(studentId) {
+      const sid = String(studentId || '').trim();
+      if (!sid) return false;
+
+      this.map.delete(sid);
+      this.saveCache();
+      this.notify();
+
+      const url = this.getEndpoint();
+      if (!url || !url.startsWith('https://script.google.com')) return true;
+
+      this.pendingSaves++;
+      try {
+        const data = await externalRequestJson(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ action: 'deleteTracking', studentId: sid }),
+          timeout: 12000
+        });
+        if (!data || !data.ok) {
+          throw new Error(data?.error || 'Entfernen im Google Sheet fehlgeschlagen.');
+        }
+        return true;
+      } finally {
+        this.pendingSaves = Math.max(0, this.pendingSaves - 1);
+      }
+    },
+
+    // Gleicht getrackte Schüler mit dem aktiven FSM-Bestand ab (nicht mehr aktive = "Archiviert")
+    async reconcileArchivedWithActiveList(activeStudents) {
+      if (!Array.isArray(activeStudents) || activeStudents.length === 0 || this.map.size === 0) return 0;
+      if (Date.now() - this.lastArchiveReconcile < 60000) return 0;
+
+      const activeIds = new Set(activeStudents.map(s => String(s.id)));
+      const updates = [];
+
+      this.map.forEach(entry => {
+        const shouldBeArchived = !activeIds.has(entry.studentId);
+        if (Boolean(entry.isArchived) !== shouldBeArchived) {
+          entry.isArchived = shouldBeArchived;
+          updates.push({ studentId: entry.studentId, isArchived: shouldBeArchived });
+        }
+      });
+
+      this.lastArchiveReconcile = Date.now();
+      if (updates.length === 0) return 0;
+
+      this.saveCache();
+      this.notify();
+
+      const url = this.getEndpoint();
+      if (url && url.startsWith('https://script.google.com')) {
+        try {
+          await externalRequestJson(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: 'syncArchived', updates }),
+            timeout: 12000
+          });
+        } catch (e) {
+          console.warn('[Dynamic Tracking] Archiv-Sync-Fehler:', e);
+        }
+      }
+      return updates.length;
+    }
+  };
+
   NotesManager.init();
+  TrackingManager.init();
+  RegDateCache.init();
 
   // ============================================================================
-  // TEIL 2/5: SCHÜLER-STORE, KARTEI-PARSER, NOTIZ-EVENTS & BOOT-ROUTER
+  // TEIL 2/5: SCHÜLER-STORE, KARTEI-PARSER (NOTIZ + TRACKING), EVENTS & ROUTER
   // ============================================================================
   const StudentStore = {
     list: [],
     karteiMap: new Map(),
     lastFetch: 0,
+    lastError: '',
     isFetching: false,
     fetchPromise: null,
     includeInactive: false,
@@ -605,7 +1240,11 @@
       const vorname = String(s.vorname ?? '');
       const karteiNr = String(s.karteiNr ?? s.displayKarteinummer ?? '');
       const id = String(s.id ?? '');
-      const fullStr = `${vorname} ${nachname} ${karteiNr} ${id}`.toLowerCase();
+      const branch = extractBranchCode(karteiNr);
+      const isActive = s.aktiv !== false && s.active !== false && s.archiviert !== true && s.archiv !== true;
+      const regDate = extractRegistrationDate(s);
+      if (id && regDate) RegDateCache.set(id, regDate);
+      const fullStr = `${vorname} ${nachname} ${karteiNr} ${branch} ${id}`.toLowerCase();
       const words = fullStr.split(/[\s,.\-_()/]+/).filter(Boolean);
       return {
         ...s,
@@ -613,6 +1252,9 @@
         _nachname: nachname,
         _vorname: vorname,
         _karteiNr: karteiNr,
+        _branch: branch,
+        _isActive: isActive,
+        _regDate: regDate,
         _klassenStr: klassenStr,
         _klassenLower: klassenStr.toLowerCase(),
         _searchLower: fullStr,
@@ -642,17 +1284,27 @@
             headers: API_HEADERS,
             credentials: 'include'
           });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) throw new Error(`FSM-Server HTTP ${res.status}`);
           const raw = await res.json();
           const rows = Array.isArray(raw.rows)
             ? raw.rows.map(r => (r && typeof r === 'object') ? (r.d || r.data || r) : r)
             : [];
-          this.list = rows.filter(s => s && s.id !== undefined && s.id !== null && s.id !== '').map(s => this.normalize(s));
+          this.list = rows
+            .filter(s => s && s.id !== undefined && s.id !== null && s.id !== '')
+            .map(s => this.normalize(s));
           this.lastFetch = Date.now();
+          this.lastError = '';
+
+          // Automatischer Archiv-Abgleich, sobald wir die vollständige Aktiv-Liste geladen haben
+          if (!targetInactive && this.list.length > 0) {
+            TrackingManager.reconcileArchivedWithActiveList(this.list);
+          }
+
           this.listeners.forEach(fn => {
             try { fn(this.list); } catch (e) {}
           });
         } catch (e) {
+          this.lastError = String(e?.message || e || 'Unbekannter Verbindungsfehler');
           console.warn('[Dynamic Store] Sync-Fehler:', e);
         } finally {
           this.isFetching = false;
@@ -675,7 +1327,21 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       this.karteiMap.set(sid, data);
+      const regDate = extractRegistrationDate(data);
+      RegDateCache.set(sid, regDate);
       return data;
+    },
+
+    getKnownRegDate(studentOrId) {
+      const isObj = studentOrId && typeof studentOrId === 'object';
+      const sid = String(isObj ? (studentOrId.id || studentOrId.studentId || '') : (studentOrId || '')).trim();
+      if (isObj && studentOrId._regDate) return studentOrId._regDate;
+      if (sid && this.karteiMap.has(sid)) {
+        const kDate = extractRegistrationDate(this.karteiMap.get(sid));
+        if (kDate) return kDate;
+      }
+      if (sid) return RegDateCache.getDate(sid);
+      return '';
     },
 
     search(query, { wordStart = true, limit = 15 } = {}) {
@@ -716,7 +1382,7 @@
   });
 
   // ============================================================================
-  // 2. STRUKTURIERTER KARTEI-PARSER (INKL. ABTEIL 5: BÜRO-NOTIZ)
+  // 2. STRUKTURIERTER KARTEI-PARSER (INKL. ABTEIL 5: BÜRO-NOTIZ & 6: TRACKING)
   // ============================================================================
   function yesNoBadge(val, warnOnTrue = false) {
     const isTrue = Boolean(val) && val !== 'Nein' && val !== 'false' && val !== 0;
@@ -749,6 +1415,9 @@
 
     const tel = pickProp(k, 'telefonMobil', 'mobil', 'handy', 'telefon') || '';
     const email = pickProp(k, 'email', 'mail') || '';
+
+    // Anmeldedatum aus der Kartei als Vorschlag vorbefüllen
+    const karteiRegDate = extractRegistrationDate(k) || studentSummary._regDate || '';
 
     const sehhilfe = pickProp(k, 'sehhilfe');
     const bf17 = pickProp(k, 'bf17');
@@ -784,12 +1453,22 @@
     const isImportant = noteObj.priority === 'warn';
     const hasGScript = Boolean(NotesManager.getEndpoint());
 
+    const trkEntry = TrackingManager.get(studentId);
+    const trkStage = trkEntry?.stage || '';
+    const trkRegDate = trkEntry?.registrationDate || karteiRegDate || '';
+    const trkStopDrive = trkEntry?.stoppedDrivingDate || '';
+    const trkStopProc = trkEntry?.processStoppedDate || '';
+    const trkNotes = trkEntry?.notes || '';
+    const trkArchived = trkEntry ? Boolean(trkEntry.isArchived) : (studentSummary._isActive === false);
+    const trkExp = checkRegistrationExpiry(trkRegDate);
+
     return `
       <div class="dyn-kcard">
         <div class="dyn-kcard-hdr">1. Person & Anschrift</div>
         <div class="dyn-kcard-body">
           <div class="dyn-krow"><span class="dyn-klbl">Karteinummer</span><span class="dyn-kval"><strong>${escapeHtml(karteiNr)}</strong></span></div>
           <div class="dyn-krow"><span class="dyn-klbl">Anrede / Name</span><span class="dyn-kval">${escapeHtml(fullName)}</span></div>
+          ${karteiRegDate ? `<div class="dyn-krow"><span class="dyn-klbl">Anmeldedatum (Kartei)</span><span class="dyn-kval"><strong>${escapeHtml(formatGermanDate(karteiRegDate))}</strong></span></div>` : ''}
           <div class="dyn-krow"><span class="dyn-klbl">Geburtsdatum</span><span class="dyn-kval">${escapeHtml(gebDatum)}</span></div>
           <div class="dyn-krow"><span class="dyn-klbl">Geburtsort</span><span class="dyn-kval">${escapeHtml(gebOrt)}</span></div>
           <div class="dyn-krow"><span class="dyn-klbl">Straße</span><span class="dyn-kval">${escapeHtml(strasse)}</span></div>
@@ -883,133 +1562,306 @@
           </div>
         </div>
       </div>
+
+      <!-- 6. SCHÜLER-TRACKING ZUORDNUNG (3 BEREICHE + GSheet SYNC) -->
+      <div class="dyn-kcard dyn-trk-card ${trkExp.isExpired ? 'trk-card-expired' : ''}" data-student-id="${escapeHtml(studentId)}">
+        <div class="dyn-kcard-hdr dyn-trk-hdr" style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span>6. Schüler-Tracking ${hasGScript ? '(GSheet Sync)' : '(Lokal)'}</span>
+          <span class="dyn-trk-meta" style="font-size:10.5px; font-weight:400; text-transform:none; opacity:0.92;">
+            ${trkEntry?.updatedAt ? `${escapeHtml(trkEntry.updatedBy || 'Büro')} · ${escapeHtml(trkEntry.updatedAt)}` : 'Nicht zugeordnet'}
+          </span>
+        </div>
+        <div class="dyn-kcard-body" style="display:flex; flex-direction:column; gap:8px; padding:9px 12px;">
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <select class="dyn-trk-stage-sel" style="flex:1; min-width:170px; height:30px; padding:0 8px; border-radius:4px; border:1px solid #cbd5e1; font-size:12.5px; font-weight:600;">
+              <option value="" ${!trkStage ? 'selected' : ''}>— Noch nicht zugeordnet —</option>
+              <option value="new" ${trkStage === 'new' ? 'selected' : ''}>🆕 Neue Schüler</option>
+              <option value="driving" ${trkStage === 'driving' ? 'selected' : ''}>🚗 Bereits am Fahren</option>
+              <option value="stopped" ${trkStage === 'stopped' ? 'selected' : ''}>🛑 Prozess abgebrochen</option>
+            </select>
+            <label style="font-size:11.5px; display:inline-flex; align-items:center; gap:4px; cursor:pointer; user-select:none;">
+              <input type="checkbox" class="dyn-trk-arch-chk" ${trkArchived ? 'checked' : ''}> 📦 Archiviert
+            </label>
+          </div>
+
+          <div class="dyn-trk-exp-banner" style="display:${trkExp.isExpired ? 'block' : 'none'}; padding:5px 8px; border-radius:4px; background:#fdecea; border:1px solid #f5c2c7; color:#b3261e; font-size:11.5px; font-weight:700;">
+            ⚠️ ${escapeHtml(trkExp.label || 'Anmeldung liegt über 2 Jahre zurück (Vertrag abgelaufen)')}
+          </div>
+
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(125px, 1fr)); gap:6px;">
+            <label style="display:flex; flex-direction:column; gap:2px; font-size:11px; color:#64748b;">
+              <span>Anmeldedatum</span>
+              <input type="date" class="dyn-trk-reg-inp" value="${escapeHtml(trkRegDate)}" style="height:28px; padding:0 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;">
+            </label>
+            <label class="dyn-trk-stopdrive-wrap" style="display:${trkStage === 'driving' || trkStage === 'stopped' ? 'flex' : 'none'}; flex-direction:column; gap:2px; font-size:11px; color:#64748b;">
+              <span>Fahren gestoppt am</span>
+              <input type="date" class="dyn-trk-stopdrive-inp" value="${escapeHtml(trkStopDrive)}" style="height:28px; padding:0 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;">
+            </label>
+            <label class="dyn-trk-stopproc-wrap" style="display:${trkStage === 'stopped' ? 'flex' : 'none'}; flex-direction:column; gap:2px; font-size:11px; color:#64748b;">
+              <span>Abgebrochen am</span>
+              <input type="date" class="dyn-trk-stopproc-inp" value="${escapeHtml(trkStopProc)}" style="height:28px; padding:0 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;">
+            </label>
+          </div>
+
+          <textarea class="dyn-note-textarea dyn-trk-notes-inp" rows="2" placeholder="Tracking-Notiz (z. B. wartet auf Fahrlehrer, pausiert bis Herbst, Grund für Abbruch)...">${escapeHtml(trkNotes)}</textarea>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; flex-wrap:wrap;">
+            <span class="dyn-trk-status" style="font-size:11px; color:#64748b;">
+              ${trkEntry ? `Bereich: ${escapeHtml(TrackingManager.STAGES[trkEntry.stage]?.label || trkEntry.stage)}` : 'Bereich wählen & speichern'}
+            </span>
+            <div style="display:flex; gap:5px;">
+              <a class="dyn-mini-btn" href="/check?mod=tracking" title="Tracking Suite öffnen">📋 Suite</a>
+              <button type="button" class="dyn-mini-btn dyn-trk-del" title="Aus Tracking entfernen" style="${trkEntry ? '' : 'display:none;'}">🗑️</button>
+              <button type="button" class="dyn-mini-btn primary dyn-trk-save">💾 Tracking speichern</button>
+            </div>
+          </div>
+        </div>
+      </div>
     `;
   }
 
   function bindKarteiNoteEvents(containerEl, student) {
     if (!containerEl || !student || !student.id) return;
     const card = containerEl.querySelector('.dyn-note-card');
-    if (!card) return;
+    if (card) {
+      const sid = String(student.id);
+      const titleEl = card.querySelector('.dyn-note-title');
+      const textarea = card.querySelector('.dyn-note-textarea');
+      const prioChk = card.querySelector('.dyn-note-prio');
+      const saveBtn = card.querySelector('.dyn-note-save');
+      const clearBtn = card.querySelector('.dyn-note-clear');
+      const cfgBtn = card.querySelector('.dyn-note-cfg');
+      const statusEl = card.querySelector('.dyn-note-status');
+      const metaEl = card.querySelector('.dyn-note-meta');
 
-    const sid = String(student.id);
-    const titleEl = card.querySelector('.dyn-note-title');
-    const textarea = card.querySelector('.dyn-note-textarea');
-    const prioChk = card.querySelector('.dyn-note-prio');
-    const saveBtn = card.querySelector('.dyn-note-save');
-    const clearBtn = card.querySelector('.dyn-note-clear');
-    const cfgBtn = card.querySelector('.dyn-note-cfg');
-    const statusEl = card.querySelector('.dyn-note-status');
-    const metaEl = card.querySelector('.dyn-note-meta');
+      isolateKeys(textarea);
 
-    isolateKeys(textarea);
+      function syncCardFromStore() {
+        const entry = NotesManager.get(sid);
+        const isImp = entry.priority === 'warn';
+        textarea.value = entry.note || '';
+        prioChk.checked = isImp;
+        card.classList.toggle('important', isImp);
+        if (clearBtn) clearBtn.style.display = entry.note ? 'inline-flex' : 'none';
+        metaEl.textContent = entry.note && entry.updatedAt
+          ? `${entry.updatedBy || 'Büro'} · ${entry.updatedAt}`
+          : 'Noch kein Eintrag';
+      }
 
-    function syncCardFromStore() {
-      const entry = NotesManager.get(sid);
-      const isImp = entry.priority === 'warn';
-      textarea.value = entry.note || '';
-      prioChk.checked = isImp;
-      card.classList.toggle('important', isImp);
-      if (clearBtn) clearBtn.style.display = entry.note ? 'inline-flex' : 'none';
-      metaEl.textContent = entry.note && entry.updatedAt
-        ? `${entry.updatedBy || 'Büro'} · ${entry.updatedAt}`
-        : 'Noch kein Eintrag';
+      card.querySelectorAll('.dyn-tag-btn').forEach(btn => {
+        btn.onclick = (e) => {
+          e.preventDefault();
+          const tag = btn.getAttribute('data-tag') || '';
+          const cur = textarea.value;
+          textarea.value = cur ? `${cur.trimEnd()}\n${tag}` : tag;
+          textarea.focus();
+        };
+      });
+
+      prioChk.onchange = () => {
+        card.classList.toggle('important', prioChk.checked);
+      };
+
+      async function triggerSave(textToSave = textarea.value, prioToSave = prioChk.checked ? 'warn' : 'normal') {
+        saveBtn.disabled = true;
+        const origText = saveBtn.textContent;
+        saveBtn.textContent = '⏳ Speichere...';
+        statusEl.style.color = '#0067B8';
+        statusEl.textContent = 'Synchronisiere mit Google Sheet...';
+
+        try {
+          const saved = await NotesManager.save(student, textToSave, prioToSave);
+          metaEl.textContent = saved.note
+            ? `${saved.updatedBy || 'Büro'} · ${saved.updatedAt || 'Gerade eben'}`
+            : 'Notiz gelöscht';
+          if (clearBtn) clearBtn.style.display = saved.note ? 'inline-flex' : 'none';
+          statusEl.style.color = '#166534';
+          statusEl.textContent = saved.localOnly
+            ? '✓ Lokal gespeichert (Sheet-URL fehlt noch)'
+            : '✓ Im Google Sheet gespeichert!';
+        } catch (err) {
+          statusEl.style.color = '#b3261e';
+          statusEl.textContent = `⚠️ Fehler: ${err.message}`;
+        } finally {
+          saveBtn.disabled = false;
+          saveBtn.textContent = origText;
+        }
+      }
+
+      saveBtn.onclick = (e) => {
+        e.preventDefault();
+        triggerSave();
+      };
+
+      if (clearBtn) {
+        clearBtn.onclick = (e) => {
+          e.preventDefault();
+          textarea.value = '';
+          prioChk.checked = false;
+          card.classList.remove('important');
+          triggerSave('', 'normal');
+        };
+      }
+
+      textarea.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+          e.preventDefault();
+          triggerSave();
+        }
+      });
+
+      cfgBtn.onclick = (e) => {
+        e.preventDefault();
+        const current = NotesManager.getEndpoint();
+        const input = window.prompt(
+          'Google Apps Script Web-App URL ("https://script.google.com/macros/s/.../exec") für den Team-Sync eintragen:\n(Leer lassen zum Zurücksetzen auf lokalen Speicher)',
+          current
+        );
+        if (input === null) return;
+        const clean = input.trim();
+        if (clean && !clean.startsWith('https://script.google.com')) {
+          statusEl.style.color = '#b3261e';
+          statusEl.textContent = '⚠️ URL muss mit https://script.google.com beginnen.';
+          return;
+        }
+        NotesManager.setEndpoint(clean);
+        const activeUrl = NotesManager.getEndpoint();
+        if (activeUrl) {
+          if (titleEl) titleEl.textContent = '5. Interne Büro-Notiz (GSheet Sync)';
+          statusEl.style.color = '#0067B8';
+          statusEl.textContent = 'Lade Daten aus Google Sheet...';
+          NotesManager.syncAll(true).then(() => {
+            syncCardFromStore();
+            statusEl.style.color = '#166534';
+            statusEl.textContent = '✓ Mit Google Sheet verbunden!';
+            cfgBtn.textContent = '⚙️ Sheet-URL';
+          });
+        } else {
+          if (titleEl) titleEl.textContent = '5. Interne Büro-Notiz (Lokal)';
+          statusEl.style.color = '#64748b';
+          statusEl.textContent = 'Auf lokalen Speicher umgestellt.';
+          cfgBtn.textContent = '⚙️ Sheet-URL verbinden';
+        }
+      };
     }
 
-    card.querySelectorAll('.dyn-tag-btn').forEach(btn => {
-      btn.onclick = (e) => {
-        e.preventDefault();
-        const tag = btn.getAttribute('data-tag') || '';
-        const cur = textarea.value;
-        textarea.value = cur ? `${cur.trimEnd()}\n${tag}` : tag;
-        textarea.focus();
-      };
-    });
+    bindKarteiTrackingEvents(containerEl, student);
+  }
 
-    prioChk.onchange = () => {
-      card.classList.toggle('important', prioChk.checked);
-    };
+  function bindKarteiTrackingEvents(containerEl, student) {
+    const card = containerEl.querySelector('.dyn-trk-card');
+    if (!card || !student || !student.id) return;
 
-    async function triggerSave(textToSave = textarea.value, prioToSave = prioChk.checked ? 'warn' : 'normal') {
+    const sid = String(student.id);
+    const stageSel = card.querySelector('.dyn-trk-stage-sel');
+    const archChk = card.querySelector('.dyn-trk-arch-chk');
+    const regInp = card.querySelector('.dyn-trk-reg-inp');
+    const stopDriveWrap = card.querySelector('.dyn-trk-stopdrive-wrap');
+    const stopDriveInp = card.querySelector('.dyn-trk-stopdrive-inp');
+    const stopProcWrap = card.querySelector('.dyn-trk-stopproc-wrap');
+    const stopProcInp = card.querySelector('.dyn-trk-stopproc-inp');
+    const notesInp = card.querySelector('.dyn-trk-notes-inp');
+    const expBanner = card.querySelector('.dyn-trk-exp-banner');
+    const saveBtn = card.querySelector('.dyn-trk-save');
+    const delBtn = card.querySelector('.dyn-trk-del');
+    const statusEl = card.querySelector('.dyn-trk-status');
+    const metaEl = card.querySelector('.dyn-trk-meta');
+
+    [regInp, stopDriveInp, stopProcInp, notesInp].forEach(isolateKeys);
+
+    function refreshFieldVisibility() {
+      const st = stageSel.value;
+      stopDriveWrap.style.display = (st === 'driving' || st === 'stopped') ? 'flex' : 'none';
+      stopProcWrap.style.display = (st === 'stopped') ? 'flex' : 'none';
+      if (st === 'stopped' && !stopProcInp.value) {
+        stopProcInp.value = getTodayIso();
+      }
+      const exp = checkRegistrationExpiry(regInp.value);
+      card.classList.toggle('trk-card-expired', exp.isExpired);
+      expBanner.style.display = exp.isExpired ? 'block' : 'none';
+      if (exp.isExpired) expBanner.textContent = `⚠️ ${exp.label}`;
+    }
+
+    stageSel.onchange = refreshFieldVisibility;
+    regInp.onchange = refreshFieldVisibility;
+
+    saveBtn.onclick = async (e) => {
+      e.preventDefault();
+      const stage = stageSel.value;
+      if (!stage) {
+        statusEl.style.color = '#b3261e';
+        statusEl.textContent = '⚠️ Bitte zuerst einen Tracking-Bereich auswählen.';
+        return;
+      }
+
       saveBtn.disabled = true;
-      const origText = saveBtn.textContent;
+      const orig = saveBtn.textContent;
       saveBtn.textContent = '⏳ Speichere...';
       statusEl.style.color = '#0067B8';
-      statusEl.textContent = 'Synchronisiere mit Google Sheet...';
+      statusEl.textContent = 'Synchronisiere Tracking...';
 
       try {
-        const saved = await NotesManager.save(student, textToSave, prioToSave);
-        metaEl.textContent = saved.note
-          ? `${saved.updatedBy || 'Büro'} · ${saved.updatedAt || 'Gerade eben'}`
-          : 'Notiz gelöscht';
-        if (clearBtn) clearBtn.style.display = saved.note ? 'inline-flex' : 'none';
+        const saved = await TrackingManager.save(student, {
+          stage,
+          registrationDate: regInp.value,
+          stoppedDrivingDate: stopDriveInp.value,
+          processStoppedDate: stopProcInp.value,
+          notes: notesInp.value,
+          isArchived: archChk.checked
+        });
+        metaEl.textContent = `${saved.updatedBy || 'Büro'} · ${saved.updatedAt || 'Gerade eben'}`;
+        if (delBtn) delBtn.style.display = 'inline-flex';
         statusEl.style.color = '#166534';
         statusEl.textContent = saved.localOnly
-          ? '✓ Lokal gespeichert (Sheet-URL fehlt noch)'
-          : '✓ Im Google Sheet gespeichert!';
+          ? '✓ Lokal gespeichert'
+          : `✓ Gespeichert (${TrackingManager.STAGES[saved.stage]?.label})`;
       } catch (err) {
         statusEl.style.color = '#b3261e';
         statusEl.textContent = `⚠️ Fehler: ${err.message}`;
       } finally {
         saveBtn.disabled = false;
-        saveBtn.textContent = origText;
+        saveBtn.textContent = orig;
       }
-    }
-
-    saveBtn.onclick = (e) => {
-      e.preventDefault();
-      triggerSave();
     };
 
-    if (clearBtn) {
-      clearBtn.onclick = (e) => {
+    if (delBtn) {
+      let armed = false;
+      let armTimer = null;
+      delBtn.onclick = async (e) => {
         e.preventDefault();
-        textarea.value = '';
-        prioChk.checked = false;
-        card.classList.remove('important');
-        triggerSave('', 'normal');
+        if (!armed) {
+          armed = true;
+          delBtn.textContent = 'Sicher?';
+          clearTimeout(armTimer);
+          armTimer = setTimeout(() => {
+            armed = false;
+            delBtn.textContent = '🗑️';
+          }, 3000);
+          return;
+        }
+        armed = false;
+        clearTimeout(armTimer);
+        delBtn.disabled = true;
+        try {
+          await TrackingManager.remove(sid);
+          stageSel.value = '';
+          stopDriveInp.value = '';
+          stopProcInp.value = '';
+          notesInp.value = '';
+          delBtn.style.display = 'none';
+          delBtn.textContent = '🗑️';
+          metaEl.textContent = 'Nicht zugeordnet';
+          statusEl.style.color = '#64748b';
+          statusEl.textContent = 'Aus Tracking entfernt.';
+          refreshFieldVisibility();
+        } catch (err) {
+          statusEl.style.color = '#b3261e';
+          statusEl.textContent = `⚠️ Fehler: ${err.message}`;
+        } finally {
+          delBtn.disabled = false;
+        }
       };
     }
-
-    textarea.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        e.preventDefault();
-        triggerSave();
-      }
-    });
-
-    cfgBtn.onclick = (e) => {
-      e.preventDefault();
-      const current = NotesManager.getEndpoint();
-      const input = window.prompt(
-        'Google Apps Script Web-App URL ("https://script.google.com/macros/s/.../exec") für den Team-Sync eintragen:\n(Leer lassen zum Zurücksetzen auf lokalen Speicher)',
-        current
-      );
-      if (input === null) return;
-      const clean = input.trim();
-      if (clean && !clean.startsWith('https://script.google.com')) {
-        statusEl.style.color = '#b3261e';
-        statusEl.textContent = '⚠️ URL muss mit https://script.google.com beginnen.';
-        return;
-      }
-      NotesManager.setEndpoint(clean);
-      const activeUrl = NotesManager.getEndpoint();
-      if (activeUrl) {
-        if (titleEl) titleEl.textContent = '5. Interne Büro-Notiz (GSheet Sync)';
-        statusEl.style.color = '#0067B8';
-        statusEl.textContent = 'Lade Notizen aus Google Sheet...';
-        NotesManager.syncAll(true).then(() => {
-          syncCardFromStore();
-          statusEl.style.color = '#166534';
-          statusEl.textContent = '✓ Mit Google Sheet verbunden!';
-          cfgBtn.textContent = '⚙️ Sheet-URL';
-        });
-      } else {
-        if (titleEl) titleEl.textContent = '5. Interne Büro-Notiz (Lokal)';
-        statusEl.style.color = '#64748b';
-        statusEl.textContent = 'Auf lokalen Speicher umgestellt.';
-        cfgBtn.textContent = '⚙️ Sheet-URL verbinden';
-      }
-    };
   }
 
   // Navigation zu /check ohne Angular-404-Redirect
@@ -1054,7 +1906,7 @@
     if (document.getElementById('dyn-portal-styles')) return;
 
     function syncPortalTheme() {
-      const isDark = localStorage.getItem('fsm_dynamic_theme') === 'dark';
+      const isDark = DynStorage.getItem('fsm_dynamic_theme') === 'dark';
       document.documentElement.classList.toggle('dyn-portal-dark', isDark);
     }
 
@@ -1110,7 +1962,7 @@
         position: absolute;
         top: 36px;
         right: 0;
-        width: 560px;
+        width: 600px;
         max-width: 94vw;
         background: #ffffff;
         border: 1px solid #cbd5e1;
@@ -1171,13 +2023,31 @@
         background: #e0f2fe;
         color: #0369a1;
         border: 1px solid #7dd3fc;
-        margin-left: 6px;
+        margin-left: 5px;
       }
       .dyn-note-indicator.warn {
         background: #fef3c7;
         color: #92400e;
         border-color: #fcd34d;
       }
+
+      .dyn-trk-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        font-size: 10.5px;
+        font-weight: 600;
+        margin-left: 5px;
+        border: 1px solid transparent;
+        white-space: nowrap;
+      }
+      .dyn-trk-pill.trk-new { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+      .dyn-trk-pill.trk-driving { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
+      .dyn-trk-pill.trk-stopped { background: #f3f4f6; color: #374151; border-color: #d1d5db; }
+      .dyn-trk-pill.trk-expired { background: #fdecea; color: #b3261e; border-color: #f5c2c7; font-weight: 700; }
+      .dyn-trk-pill.trk-archived { background: #f1f5f9; color: #64748b; border-color: #cbd5e1; }
 
       .dyn-k-backdrop {
         position: fixed;
@@ -1193,7 +2063,7 @@
       .dyn-k-backdrop.open { display: flex; }
       .dyn-k-box {
         width: 100%;
-        max-width: 620px;
+        max-width: 650px;
         background: #ffffff;
         border-radius: 8px;
         border: 1px solid #cbd5e1;
@@ -1207,7 +2077,7 @@
         top: 60px;
         right: 0;
         bottom: 0;
-        width: 420px;
+        width: 440px;
         max-width: 92vw;
         background: #f1f5f9;
         border-left: 2px solid #00394d;
@@ -1258,6 +2128,13 @@
       }
       .dyn-kcard.dyn-note-card.important .dyn-note-hdr {
         background: #b45309;
+      }
+      .dyn-kcard.trk-card-expired {
+        border-color: #dc2626;
+        box-shadow: 0 0 0 1.5px #dc2626;
+      }
+      .dyn-kcard.trk-card-expired .dyn-trk-hdr {
+        background: #b91c1c;
       }
       .dyn-kcard-hdr {
         background: #00394d;
@@ -1498,6 +2375,21 @@
         color: #94a3b8;
         border-color: #26323d;
       }
+      html.dyn-portal-dark .dyn-trk-pill.trk-new {
+        background: rgba(59, 130, 246, 0.18); color: #93c5fd; border-color: rgba(59, 130, 246, 0.45);
+      }
+      html.dyn-portal-dark .dyn-trk-pill.trk-driving {
+        background: rgba(22, 163, 74, 0.18); color: #6ee7b7; border-color: rgba(22, 163, 74, 0.45);
+      }
+      html.dyn-portal-dark .dyn-trk-pill.trk-stopped {
+        background: #1e293b; color: #cbd5e1; border-color: #334155;
+      }
+      html.dyn-portal-dark .dyn-trk-pill.trk-expired {
+        background: rgba(220, 38, 38, 0.22); color: #fca5a5; border-color: rgba(220, 38, 38, 0.5);
+      }
+      html.dyn-portal-dark .dyn-trk-pill.trk-archived {
+        background: #172028; color: #94a3b8; border-color: #26323d;
+      }
     `;
     document.head.appendChild(style);
     CustomLogoManager.apply();
@@ -1541,10 +2433,13 @@
 
       actionsEl.innerHTML = `
         <a class="dyn-mini-btn accent" href="/check?mod=theorie&student=${sid}">
-          <i class="material-icons" style="font-size:14px;">fact_check</i> Theorie-Check
+          <i class="material-icons" style="font-size:14px;">fact_check</i> Theorie
         </a>
         <a class="dyn-mini-btn accent" href="/check?mod=praxis&student=${sid}">
-          <i class="material-icons" style="font-size:14px;">add_road</i> Pflichtfahrten
+          <i class="material-icons" style="font-size:14px;">add_road</i> Praxis
+        </a>
+        <a class="dyn-mini-btn accent" href="/check?mod=tracking&student=${sid}">
+          <i class="material-icons" style="font-size:14px;">checklist</i> Tracking
         </a>
         <a class="dyn-mini-btn primary" href="/schueler/${sid}/leistungen">
           <i class="material-icons" style="font-size:14px;">list_alt</i> Leistungen
@@ -1622,9 +2517,10 @@
         return `
         <div class="dyn-drop-item">
           <div style="min-width:0;">
-            <div style="font-weight:600; font-size:13.5px; display:flex; align-items:center; flex-wrap:wrap;">
+            <div style="font-weight:600; font-size:13.5px; display:flex; align-items:center; flex-wrap:wrap; row-gap:2px;">
               <span>${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}</span>
               ${NotesManager.badgeHtml(s.id)}
+              ${TrackingManager.badgeHtml(s.id)}
             </div>
             <div style="font-size:11.5px; color:#64748b;">
               Kartei: <strong>${escapeHtml(s._karteiNr || '—')}</strong> · Klasse: <strong>${escapeHtml(s._klassenStr || '—')}</strong>
@@ -1632,7 +2528,7 @@
             </div>
           </div>
           <div class="dyn-drop-actions">
-            <button type="button" class="dyn-mini-btn primary btn-open-kartei" title="Karteikarte & Notiz rechts öffnen">
+            <button type="button" class="dyn-mini-btn primary btn-open-kartei" title="Karteikarte, Notiz & Tracking rechts öffnen">
               <i class="material-icons" style="font-size:13px;">contact_page</i> Kartei
             </button>
             <a class="dyn-mini-btn" href="/schueler/${sid}/leistungen" title="Leistungen & Stunden">Leistungen</a>
@@ -1665,11 +2561,11 @@
       }
 
       globalStatus.textContent = q.trim()
-        ? `${hits.length} Treffer (Klick öffnet Kartei & Notiz rechts · Enter = 1. Treffer)`
+        ? `${hits.length} Treffer (Klick öffnet Kartei, Notiz & Tracking rechts · Enter = 1. Treffer)`
         : `Bereit — ${StudentStore.list.length} Schüler im Schnellzugriff (ESC zum Schließen)`;
 
       if (!q.trim()) {
-        globalResults.innerHTML = `<div style="padding:18px; text-align:center; color:#64748b; font-size:13px;">Tippe einen Namen oder eine Kartei-Nr. ein, um sofort die Karteikarte & Büro-Notiz zu öffnen.</div>`;
+        globalResults.innerHTML = `<div style="padding:18px; text-align:center; color:#64748b; font-size:13px;">Tippe einen Namen oder eine Kartei-Nr. ein, um sofort die Karteikarte, Büro-Notiz & Tracking-Zuordnung zu öffnen.</div>`;
         return;
       }
 
@@ -1753,7 +2649,8 @@
           ul.appendChild(createItem('#blitzsuche', 'bolt', 'Blitzsuche (Strg+K)', openGlobalSearch));
           ul.appendChild(createItem('/check?mod=theorie', 'fact_check', 'Theorie-Check'));
           ul.appendChild(createItem('/check?mod=praxis', 'add_road', 'Pflichtfahrten-Check'));
-          ul.appendChild(createItem('/check?mod=dokumente', 'assignment_turned_in', 'Kartei & Akten-Check'));
+          ul.appendChild(createItem('/check?mod=dokumente', 'assignment_turned_in', 'Kartei & Notizen'));
+          ul.appendChild(createItem('/check?mod=tracking', 'checklist', 'Schüler-Tracking'));
 
           statistikUl.insertAdjacentElement('afterend', ul);
           statistikUl.insertAdjacentElement('afterend', sep);
@@ -1810,7 +2707,7 @@
             hits = StudentStore.search(q, { wordStart: false, limit: 15 });
           }
 
-          countEl.textContent = `${hits.length} Treffer — Klick öffnet Kartei & Notiz rechts`;
+          countEl.textContent = `${hits.length} Treffer — Klick öffnet Kartei, Notiz & Tracking`;
           if (hits.length === 0) {
             listEl.innerHTML = `<div style="padding:12px; color:#b3261e; font-size:12.5px;">Kein aktiver Schüler gefunden. (Tipp: Strg+K für Archivsuche)</div>`;
             return;
@@ -1862,7 +2759,7 @@
   }
 
   // ============================================================================
-  // TEIL 4/5: PRÜF-CENTER APP (/check) — START & HTML/CSS-TEMPLATE
+  // TEIL 4/5: PRÜF-CENTER APP (/check) — START & HTML/CSS-TEMPLATE (INKL. TAB 4 TRACKING)
   // ============================================================================
   function startDynamicControlCenter() {
     controlCenterActive = true;
@@ -1883,6 +2780,10 @@
       NotesManager.listeners.delete(appNotesListener);
       appNotesListener = null;
     }
+    if (appTrackingListener) {
+      TrackingManager.listeners.delete(appTrackingListener);
+      appTrackingListener = null;
+    }
 
     try { pageWin.stop(); } catch (e) {}
     document.documentElement.classList.remove('dyn-portal-dark');
@@ -1898,7 +2799,7 @@
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Dynamic Tools - Fahrschul-Manager</title>
+      <title>Dynamic Tools & Tracking - Fahrschul-Manager</title>
       <link rel="preconnect" href="https://fonts.googleapis.com">
       <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap">
       <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
@@ -2065,39 +2966,41 @@
           padding: 0 20px;
           z-index: 900;
           border-bottom: 1px solid rgba(255,255,255,0.12);
+          gap: 10px;
         }
-        .topbar-left { display: flex; align-items: center; gap: 16px; }
-        .topbar-title { font-size: 20px; font-weight: 500; margin: 0; display: flex; align-items: center; gap: 10px; }
+        .topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .topbar-title { font-size: 18px; font-weight: 500; margin: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
         .dynamic-pill {
-          font-size: 11px;
+          font-size: 10.5px;
           font-weight: 700;
           letter-spacing: 0.8px;
-          padding: 3px 8px;
+          padding: 3px 7px;
           border-radius: 4px;
           background: linear-gradient(135deg, #2E80C5 0%, #3B4998 100%);
           color: #fff;
         }
 
-        .module-tabs { display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.22); padding: 3px; border-radius: 6px; }
+        .module-tabs { display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.22); padding: 3px; border-radius: 6px; overflow-x: auto; }
         .mod-tab {
           border: none;
           background: transparent;
           color: rgba(255,255,255,0.75);
-          padding: 6px 12px;
+          padding: 6px 10px;
           border-radius: 4px;
           font-family: inherit;
-          font-size: 12.5px;
+          font-size: 12px;
           font-weight: 500;
           cursor: pointer;
           display: inline-flex;
           align-items: center;
-          gap: 6px;
+          gap: 5px;
+          white-space: nowrap;
         }
         .mod-tab:hover { color: #ffffff; background: rgba(255,255,255,0.08); }
         .mod-tab.active { background: #ffffff; color: #00394d; font-weight: 600; }
         html.dark .mod-tab.active { background: #2E80C5; color: #ffffff; }
 
-        .topbar-right { display: flex; align-items: center; gap: 12px; }
+        .topbar-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
         .v-sep { width: 1px; height: 28px; background: rgba(255,255,255,0.3); }
         .user-display { display: grid; font-size: 12px; line-height: 14px; text-align: left; color: #ffffff; }
 
@@ -2130,7 +3033,7 @@
           border: 1px solid rgba(255, 255, 255, 0.25);
           color: #ffffff;
           height: 34px;
-          padding: 0 12px;
+          padding: 0 11px;
           border-radius: 6px;
           font-family: inherit;
           font-size: 12.5px;
@@ -2244,33 +3147,14 @@
           cursor: pointer;
           transition: border-color 0.15s, background 0.15s;
         }
-        .opt-card:hover {
-          border-color: var(--dynamic-blue);
-        }
+        .opt-card:hover { border-color: var(--dynamic-blue); }
         .opt-card.active-potsdam {
           background: var(--ext-bg);
           border-color: var(--ext-border);
         }
-        .opt-card-info {
-          display: flex;
-          flex-direction: column;
-          gap: 3px;
-          flex: 1;
-        }
-        .opt-card-title {
-          font-size: 13px;
-          font-weight: 600;
-          color: var(--text);
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          flex-wrap: wrap;
-        }
-        .opt-card-desc {
-          font-size: 11.5px;
-          color: var(--text-secondary);
-          line-height: 1.38;
-        }
+        .opt-card-info { display: flex; flex-direction: column; gap: 3px; flex: 1; }
+        .opt-card-title { font-size: 13px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .opt-card-desc { font-size: 11.5px; color: var(--text-secondary); line-height: 1.38; }
         .opt-footer {
           padding: 9px 14px;
           background: var(--surface-muted);
@@ -2307,6 +3191,7 @@
           align-items: center;
           justify-content: space-between;
           gap: 12px;
+          flex-wrap: wrap;
         }
 
         .fsm-toolbar {
@@ -2445,13 +3330,32 @@
           background: #e0f2fe;
           color: #0369a1;
           border: 1px solid #7dd3fc;
-          margin-left: 6px;
+          margin-left: 5px;
         }
         .dyn-note-indicator.warn {
           background: var(--warn-bg);
           color: var(--warn-text);
           border-color: var(--warn-border);
         }
+
+        .dyn-trk-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 3px;
+          padding: 1px 6px;
+          border-radius: 3px;
+          font-size: 10.5px;
+          font-weight: 600;
+          margin-left: 5px;
+          border: 1px solid transparent;
+          white-space: nowrap;
+        }
+        .dyn-trk-pill.trk-new { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+        .dyn-trk-pill.trk-driving { background: var(--ok-bg); color: var(--ok-text); border-color: var(--ok-border); }
+        .dyn-trk-pill.trk-stopped { background: var(--surface-muted); color: var(--text-secondary); border-color: var(--border); }
+        .dyn-trk-pill.trk-expired { background: var(--err-bg); color: var(--err-text); border-color: var(--err-border); font-weight: 700; }
+        .dyn-trk-pill.trk-archived { background: var(--surface-muted); color: var(--text-muted); border-color: var(--border); }
+        html.dark .dyn-trk-pill.trk-new { background: rgba(59, 130, 246, 0.18); color: #93c5fd; border-color: rgba(59, 130, 246, 0.45); }
 
         .expert-only { display: none !important; }
         body.mode-expert .expert-only { display: inline-flex !important; }
@@ -2484,9 +3388,13 @@
         table.fsm-grid tbody tr.row-external { background-color: var(--ext-bg) !important; }
         table.fsm-grid tbody tr.row-violation { background-color: var(--err-bg) !important; color: var(--err-text); font-weight: 600; }
         table.fsm-grid tbody tr.row-sonder { background-color: rgba(0, 103, 184, 0.08); }
+        table.fsm-grid tbody tr.trk-row-expired { background-color: var(--err-bg) !important; color: var(--err-text); }
+        table.fsm-grid tbody tr.trk-row-expired td { color: var(--err-text); }
+        table.fsm-grid tbody tr.trk-row-archived { opacity: 0.72; }
+        table.fsm-grid tbody tr.trk-row-archived:not(.trk-row-expired) { background-color: var(--surface-muted) !important; color: var(--text-muted); }
         table.fsm-grid tbody td {
-          padding: 2px 8px;
-          height: 26px;
+          padding: 3px 8px;
+          height: 28px;
           vertical-align: middle;
           border-bottom: 1px solid var(--border-cell);
           white-space: nowrap;
@@ -2511,12 +3419,206 @@
           font-size: 11px;
           font-weight: 600;
           border: 1px solid transparent;
+          white-space: nowrap;
         }
         .b-yes { background: var(--ok-bg); color: var(--ok-text); border-color: var(--ok-border); }
         .b-no { background: var(--err-bg); color: var(--err-text); border-color: var(--err-border); }
         .b-warn { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
-        .b-open { color: var(--text-muted); font-weight: 400; }
+        .b-open { color: var(--text-muted); font-weight: 400; border-color: var(--border); background: var(--surface-muted); }
         .b-ext { background: var(--ext-bg); color: var(--ext-text); border-color: var(--ext-border); }
+
+        /* --- TRACKING SUITE STYLES --- */
+        .trk-branch-bar {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 6px;
+          padding: 9px 14px;
+          background: var(--surface-muted);
+          border-bottom: 1px solid var(--border);
+        }
+        .trk-branch-lbl {
+          font-size: 11.5px;
+          font-weight: 700;
+          color: var(--text-secondary);
+          margin-right: 4px;
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .trk-branch-btn {
+          height: 27px;
+          padding: 0 10px;
+          border-radius: 999px;
+          border: 1px solid var(--border);
+          background: var(--surface);
+          color: var(--text);
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 500;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          transition: all 0.12s;
+        }
+        .trk-branch-btn:hover { border-color: var(--dynamic-blue); }
+        .trk-branch-btn.active {
+          background: var(--fsm-petrol);
+          color: #ffffff;
+          border-color: var(--fsm-petrol);
+          font-weight: 600;
+        }
+        html.dark .trk-branch-btn.active {
+          background: #0067B8;
+          border-color: #0067B8;
+        }
+        .trk-branch-cnt {
+          font-size: 10.5px;
+          padding: 0 5px;
+          border-radius: 999px;
+          background: rgba(0, 0, 0, 0.1);
+        }
+        .trk-branch-btn.active .trk-branch-cnt {
+          background: rgba(255, 255, 255, 0.22);
+          color: #ffffff;
+        }
+
+        .trk-subtabs {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          flex-wrap: wrap;
+          gap: 10px;
+          padding: 10px 14px;
+          background: var(--surface);
+          border-bottom: 1px solid var(--border);
+        }
+        .trk-subtab-group {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .trk-subtab {
+          height: 34px;
+          padding: 0 13px;
+          border-radius: 6px;
+          border: 1px solid var(--border);
+          background: var(--surface-muted);
+          color: var(--text);
+          font-family: inherit;
+          font-size: 12.5px;
+          font-weight: 600;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          transition: all 0.12s;
+        }
+        .trk-subtab:hover { border-color: var(--dynamic-blue); }
+        .trk-subtab.active {
+          background: var(--fsm-petrol);
+          color: #ffffff;
+          border-color: var(--fsm-petrol);
+        }
+        html.dark .trk-subtab.active {
+          background: #0067B8;
+          border-color: #0067B8;
+        }
+        .trk-count {
+          font-size: 11px;
+          padding: 1px 6px;
+          border-radius: 999px;
+          background: rgba(0, 0, 0, 0.08);
+          font-weight: 700;
+        }
+        .trk-subtab.active .trk-count {
+          background: rgba(255, 255, 255, 0.24);
+          color: #ffffff;
+        }
+
+        .trk-assign-bar {
+          padding: 10px 14px;
+          background: var(--fsm-filter-bg);
+          border-bottom: 1px solid var(--border);
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: flex-end;
+        }
+        .trk-assign-search-wrap {
+          position: relative;
+          flex: 1.4;
+          min-width: 240px;
+        }
+        .trk-assign-dropdown {
+          position: absolute;
+          top: 52px;
+          left: 0;
+          right: 0;
+          max-height: 260px;
+          overflow-y: auto;
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: 5px;
+          box-shadow: 0 10px 26px rgba(0, 0, 0, 0.24);
+          z-index: 40;
+          display: none;
+        }
+        .trk-assign-dropdown.open { display: block; }
+        .trk-assign-hit {
+          padding: 7px 10px;
+          border-bottom: 1px solid var(--border-cell);
+          cursor: pointer;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+          font-size: 12.5px;
+        }
+        .trk-assign-hit:hover { background: var(--fsm-petrol-row-hover); }
+
+        .trk-status-strip {
+          padding: 6px 14px;
+          font-size: 12px;
+          border-bottom: 1px solid var(--border);
+          background: var(--surface-muted);
+          color: var(--text-secondary);
+          display: none;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+        }
+        .trk-status-strip.show { display: flex; }
+        .trk-status-strip.is-err { background: var(--err-bg); color: var(--err-text); font-weight: 600; }
+        .trk-status-strip.is-ok { background: var(--ok-bg); color: var(--ok-text); font-weight: 600; }
+
+        .trk-inline-date {
+          height: 25px !important;
+          padding: 0 5px !important;
+          font-size: 11.5px !important;
+          width: 124px;
+        }
+        .trk-inline-note {
+          height: 25px !important;
+          padding: 0 7px !important;
+          font-size: 11.5px !important;
+          min-width: 170px;
+          width: 100%;
+        }
+        .trk-stage-select {
+          height: 25px !important;
+          padding: 0 6px !important;
+          font-size: 11.5px !important;
+          font-weight: 600;
+        }
+        .trk-note-cell {
+          white-space: normal !important;
+          max-width: 280px;
+          min-width: 150px;
+          line-height: 1.3;
+          font-size: 12px;
+        }
 
         .verdict-box {
           border-radius: 4px;
@@ -2649,14 +3751,8 @@
           border-bottom: 1px solid var(--border-cell);
           vertical-align: middle;
         }
-        .w-lesson-table tr.w-row-expired {
-          background: var(--err-bg);
-        }
-        .w-lesson-date-edit {
-          height: 26px !important;
-          padding: 0 6px !important;
-          font-size: 12px !important;
-        }
+        .w-lesson-table tr.w-row-expired { background: var(--err-bg); }
+        .w-lesson-date-edit { height: 26px !important; padding: 0 6px !important; font-size: 12px !important; }
 
         .matrix-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
         .m-pill {
@@ -2690,9 +3786,12 @@
           border-color: #f59e0b;
           box-shadow: 0 0 0 1.5px #f59e0b;
         }
-        .dyn-kcard.dyn-note-card.important .dyn-note-hdr {
-          background: #b45309;
+        .dyn-kcard.dyn-note-card.important .dyn-note-hdr { background: #b45309; }
+        .dyn-kcard.trk-card-expired {
+          border-color: var(--err-solid);
+          box-shadow: 0 0 0 1.5px var(--err-solid);
         }
+        .dyn-kcard.trk-card-expired .dyn-trk-hdr { background: #b91c1c; }
         .dyn-kcard-hdr {
           background: var(--fsm-petrol);
           color: #ffffff;
@@ -2765,16 +3864,20 @@
           align-items: center;
           justify-content: center;
           z-index: 9999;
+          padding: 16px;
         }
         .modal-bg.open { display: flex; }
         .modal-box {
           background: var(--surface);
           border: 1px solid var(--border);
-          border-radius: 4px;
+          border-radius: 6px;
           width: 100%;
           max-width: 340px;
           overflow: hidden;
-          box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+          box-shadow: 0 12px 30px rgba(0,0,0,0.32);
+        }
+        .modal-box.trk-modal-box {
+          max-width: 540px;
         }
 
         #printSheet { display: none; }
@@ -2821,6 +3924,7 @@
           <li><a data-side-mod="theorie" class="active-tool"><span class="icons"><i class="material-icons" style="color:#38bdf8;">fact_check</i></span><span class="nav-text">Theorie-Check</span></a></li>
           <li><a data-side-mod="praxis"><span class="icons"><i class="material-icons" style="color:#38bdf8;">add_road</i></span><span class="nav-text">Pflichtfahrten-Check</span></a></li>
           <li><a data-side-mod="dokumente"><span class="icons"><i class="material-icons" style="color:#38bdf8;">assignment_turned_in</i></span><span class="nav-text">Kartei & Notizen</span></a></li>
+          <li><a data-side-mod="tracking"><span class="icons"><i class="material-icons" style="color:#38bdf8;">checklist</i></span><span class="nav-text">Schüler-Tracking</span></a></li>
         </ul>
 
         <span class="fsm-sep"></span>
@@ -2845,7 +3949,7 @@
       <header class="fsm-topbar">
         <div class="topbar-left">
           <a href="https://portal.fahrschulmanager.de/schueler" class="btn btn-outline btn-sm" style="background:rgba(255,255,255,0.14); color:#fff; border-color:rgba(255,255,255,0.3); font-weight:600;">
-            <i class="material-icons" style="font-size:15px;">arrow_back</i> Zurück zu Fahrschüler
+            <i class="material-icons" style="font-size:15px;">arrow_back</i> Zurück
           </a>
           <h1 class="topbar-title">
             <span>Dynamic Tools</span>
@@ -2854,13 +3958,16 @@
 
           <div class="module-tabs">
             <button type="button" class="mod-tab active" data-mod="theorie">
-              <i class="material-icons" style="font-size:16px;">fact_check</i> 1. Theorie-Check
+              <i class="material-icons" style="font-size:15px;">fact_check</i> 1. Theorie
             </button>
             <button type="button" class="mod-tab" data-mod="praxis">
-              <i class="material-icons" style="font-size:16px;">add_road</i> 2. Praxis & Pflichtfahrten
+              <i class="material-icons" style="font-size:15px;">add_road</i> 2. Praxis
             </button>
             <button type="button" class="mod-tab" data-mod="dokumente">
-              <i class="material-icons" style="font-size:16px;">contact_page</i> 3. Kartei & Büro-Notizen
+              <i class="material-icons" style="font-size:15px;">contact_page</i> 3. Kartei & Notizen
+            </button>
+            <button type="button" class="mod-tab" data-mod="tracking">
+              <i class="material-icons" style="font-size:15px;">checklist</i> 4. Schüler-Tracking
             </button>
           </div>
         </div>
@@ -2946,11 +4053,18 @@
 
       <!-- WORKSPACE -->
       <main class="fsm-workspace">
-        <section class="fsm-card">
+        <section class="fsm-card" id="topStudentListCard">
           <div class="fsm-toolbar">
-            <div class="field" style="flex:1; min-width:220px;">
+            <div class="field" style="flex:1; min-width:210px;">
               <span class="field-label">Schnellsuche (Name, Vorname, Kartei-Nr.)</span>
-              <input id="qText" type="text" class="fsm-filter-input" placeholder="Name oder Kartei-Nr. eintippen (z. B. Schulz, Nina Sophie oder KWS 7692)..." autocomplete="off">
+              <input id="qText" type="text" class="fsm-filter-input" placeholder="Name oder Kartei-Nr. eintippen (z. B. Schulz oder KWS 7692)..." autocomplete="off">
+            </div>
+
+            <div class="field" style="min-width:135px;">
+              <span class="field-label">📍 Filiale (Kürzel)</span>
+              <select id="qBranch">
+                <option value="ALL">Alle Filialen</option>
+              </select>
             </div>
 
             <div class="field">
@@ -2961,13 +4075,13 @@
               </select>
             </div>
 
-            <div class="field" style="min-width:210px;">
+            <div class="field" style="min-width:200px;">
               <span class="field-label"><span class="req-badge">PFLICHT</span> Geprüft durch (Büro-Kraft)</span>
               <input id="workerName" type="text" placeholder="Vor- und Nachname eintragen" autocomplete="off">
             </div>
 
             <button id="btnClearFilter" type="button" class="btn btn-outline">Reset</button>
-            <button id="btnReloadList" type="button" class="btn btn-outline" title="Schüler & Google-Sheet-Notizen synchronisieren">↻ Sync</button>
+            <button id="btnReloadList" type="button" class="btn btn-outline" title="Schüler, Tracking & Google-Sheet-Notizen synchronisieren">↻ Sync</button>
 
             <!-- EXPERT CONTROLS -->
             <div class="field expert-only">
@@ -2994,9 +4108,9 @@
                 <tr>
                   <th style="width:110px;">Kartei-Nr.</th>
                   <th>Name, Vorname</th>
-                  <th style="width:100px;">Klasse(n)</th>
-                  <th style="width:165px;">1. Theorie-Check</th>
-                  <th style="width:185px;">2. Pflichtfahrten-Check</th>
+                  <th style="width:95px;">Klasse(n)</th>
+                  <th style="width:155px;">1. Theorie-Check</th>
+                  <th style="width:170px;">2. Pflichtfahrten-Check</th>
                   <th style="width:210px; text-align:right;">Aktion</th>
                 </tr>
               </thead>
@@ -3217,16 +4331,151 @@
           </div>
         </section>
 
-        <!-- MODULE 3: AUFGERÄUMTE SCHÜLER-KARTEI & NOTIZ -->
+        <!-- MODULE 3: AUFGERÄUMTE SCHÜLER-KARTEI, NOTIZ & TRACKING -->
         <section id="modDokumente" class="fsm-card" style="display:none;">
           <div class="fsm-card-header">
-            <span id="karteiTabTitle">3. Schüler-Kartei & Büro-Notizen</span>
+            <span id="karteiTabTitle">3. Schüler-Kartei, Büro-Notizen & Tracking</span>
             <div id="karteiTabLinks" style="display:flex; gap:6px;"></div>
           </div>
           <div id="karteiTabBody" style="padding:14px;">
             <div style="padding:20px; text-align:center; color:var(--text-muted); border:1px dashed var(--border); border-radius:4px;">
-              Klicke oben in der Schülerliste bei einem Schüler auf <strong>„Kartei“</strong> oder <strong>„Prüfen“</strong>, um die übersichtliche Karteikarte und das Google-Sheet-Notizfeld anzuzeigen.
+              Klicke oben in der Schülerliste bei einem Schüler auf <strong>„Kartei“</strong> oder <strong>„Prüfen“</strong>, um die übersichtliche Karteikarte, das Büro-Notizfeld und die Tracking-Zuordnung anzuzeigen.
             </div>
+          </div>
+        </section>
+
+        <!-- MODULE 4: SCHÜLER-TRACKING SUITE (3 BEREICHE + NICHT ZUGEORDNET + FILIAL-FILTER) -->
+        <section id="modTracking" class="fsm-card" style="display:none;">
+          <div class="fsm-card-header">
+            <span id="trkHeaderTitle">4. Schüler-Tracking Suite — Alle Filialen (Google Sheets Sync)</span>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button type="button" id="btnTrkFetchRegDates" class="btn btn-outline btn-sm" style="background:#fff; color:#00394d; border:none; font-weight:600;" title="Fehlende Anmeldedaten direkt aus den FSM-Karteien nachladen">
+                📅 Anmeldedaten laden
+              </button>
+              <button type="button" id="btnTrkReconcile" class="btn btn-outline btn-sm" style="background:rgba(255,255,255,0.16); color:#fff; border-color:rgba(255,255,255,0.3);" title="Prüft, welche Schüler im FSM inzwischen inaktiv/archiviert sind">
+                📦 Archiv abgleichen
+              </button>
+              <button type="button" id="btnTrkSync" class="btn btn-outline btn-sm" style="background:rgba(255,255,255,0.16); color:#fff; border-color:rgba(255,255,255,0.3);" title="Tracking-Daten frisch aus Google Sheets & FSM laden">
+                ↻ Sheet-Sync
+              </button>
+              <button type="button" id="btnTrkSheetUrl" class="btn btn-outline btn-sm" style="background:rgba(255,255,255,0.16); color:#fff; border-color:rgba(255,255,255,0.3);" title="Google Apps Script Web-App URL anzeigen oder ändern">
+                ⚙️ Sheet-URL
+              </button>
+            </div>
+          </div>
+
+          <!-- Inline-Konfiguration für Google Apps Script URL -->
+          <div id="trkUrlBar" style="display:none; padding:9px 14px; background:var(--warn-bg); border-bottom:1px solid var(--warn-border); gap:8px; flex-wrap:wrap; align-items:flex-end;">
+            <div class="field" style="flex:1; min-width:280px;">
+              <span class="field-label" style="color:var(--warn-text); font-weight:700;">Google Apps Script Web-App URL (https://script.google.com/macros/s/.../exec)</span>
+              <input type="text" id="trkUrlInput" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="off">
+            </div>
+            <button type="button" id="btnTrkUrlSave" class="btn btn-petrol">💾 URL speichern & synchronisieren</button>
+            <button type="button" id="btnTrkUrlCancel" class="btn btn-outline">Schließen</button>
+          </div>
+
+          <!-- Dynamische Filial-Leiste (aus Kartei-Nr.-Kürzel & Google-Sheet "Filialen") -->
+          <div class="trk-branch-bar" id="trkBranchBar"></div>
+
+          <!-- 4 Bereichs-Sub-Tabs -->
+          <div class="trk-subtabs">
+            <div class="trk-subtab-group">
+              <button type="button" class="trk-subtab active" data-trk-stage="unassigned">
+                <span>📥 Nicht zugeordnet</span>
+                <span class="trk-count" id="trkCntUnassigned">0</span>
+              </button>
+              <button type="button" class="trk-subtab" data-trk-stage="new">
+                <span>🆕 Neue Schüler</span>
+                <span class="trk-count" id="trkCntNew">0</span>
+              </button>
+              <button type="button" class="trk-subtab" data-trk-stage="driving">
+                <span>🚗 Bereits am Fahren</span>
+                <span class="trk-count" id="trkCntDriving">0</span>
+              </button>
+              <button type="button" class="trk-subtab" data-trk-stage="stopped">
+                <span>🛑 Prozess abgebrochen</span>
+                <span class="trk-count" id="trkCntStopped">0</span>
+              </button>
+            </div>
+
+            <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+              <span id="trkExpiredBadge" class="fsm-badge b-no" style="display:none;" title="Anmeldedatum liegt über 2 Jahre zurück (Vertrag abgelaufen)">⚠️ 0 &gt;2 J.</span>
+              <span id="trkArchivedBadge" class="fsm-badge b-open" style="display:none;" title="Im FSM inaktiv / von Buchhaltung archiviert">📦 0 Archiv</span>
+            </div>
+          </div>
+
+          <!-- Schnell-Zuweisung (beliebiger FSM-Schüler) -->
+          <div class="trk-assign-bar">
+            <div class="field trk-assign-search-wrap">
+              <span class="field-label">Schüler aus FSM suchen & direkt zuweisen</span>
+              <input type="text" id="trkAssignSearch" placeholder="Name oder Kartei-Nr. eintippen (z. B. PS1234)..." autocomplete="off">
+              <div id="trkAssignDropdown" class="trk-assign-dropdown"></div>
+            </div>
+            <div class="field" style="min-width:155px;">
+              <span class="field-label">Ziel-Bereich</span>
+              <select id="trkAssignStage">
+                <option value="new">🆕 Neue Schüler</option>
+                <option value="driving">🚗 Bereits am Fahren</option>
+                <option value="stopped">🛑 Prozess abgebrochen</option>
+              </select>
+            </div>
+            <div class="field" style="min-width:138px;">
+              <span class="field-label">Anmeldedatum (Auto)</span>
+              <input type="date" id="trkAssignRegDate">
+            </div>
+            <div class="field" style="flex:1; min-width:180px;">
+              <span class="field-label">Notiz (optional)</span>
+              <input type="text" id="trkAssignNote" placeholder="z. B. wartet auf Fahrlehrer...">
+            </div>
+            <button type="button" id="btnTrkQuickAssign" class="btn btn-petrol" disabled>
+              <i class="material-icons" style="font-size:16px;">add_task</i> Zuweisen
+            </button>
+          </div>
+
+          <!-- Tabellen-Filterleiste -->
+          <div class="fsm-toolbar" style="padding:8px 14px;">
+            <div class="field" style="flex:1; min-width:200px;">
+              <span class="field-label">In dieser Liste filtern</span>
+              <input type="text" id="trkSearchInput" class="fsm-filter-input" placeholder="Name, Kartei-Nr., Klasse oder Notiz filtern..." autocomplete="off">
+            </div>
+            <div class="field" style="min-width:190px;">
+              <span class="field-label">Sortierung</span>
+              <select id="trkSortSelect">
+                <option value="kartei" selected>Filiale & Kartei-Nr.</option>
+                <option value="name">Name (A–Z)</option>
+                <option value="reg_asc">Anmeldedatum (älteste zuerst)</option>
+                <option value="reg_desc">Anmeldedatum (neueste zuerst)</option>
+                <option value="updated">Zuletzt bearbeitet</option>
+              </select>
+            </div>
+            <label style="display:inline-flex; align-items:center; gap:5px; font-size:12px; cursor:pointer; height:32px; user-select:none;">
+              <input type="checkbox" id="trkShowArchived" checked> 📦 Archivierte anzeigen
+            </label>
+            <label style="display:inline-flex; align-items:center; gap:5px; font-size:12px; cursor:pointer; height:32px; color:var(--err-text); font-weight:600; user-select:none;">
+              <input type="checkbox" id="trkOnlyExpired"> ⚠️ Nur &gt;2 Jahre (Rot)
+            </label>
+          </div>
+
+          <!-- Status / Fortschrittsleiste -->
+          <div id="trkStatusBanner" class="trk-status-strip">
+            <span id="trkStatusText"></span>
+            <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
+              <button type="button" id="btnTrkJumpAction" class="btn btn-outline btn-sm" style="display:none;"></button>
+              <button type="button" id="btnTrkStopRegFetch" class="btn btn-outline btn-sm" style="display:none;">Stopp</button>
+            </div>
+          </div>
+
+          <!-- Haupttabelle der Tracking Suite -->
+          <div class="fsm-table-scroll" style="max-height:500px;">
+            <table class="fsm-grid">
+              <thead id="trkThead"></thead>
+              <tbody id="trkTbody"></tbody>
+              <tfoot>
+                <tr>
+                  <td colspan="10" id="trkFootText">Lade Tracking-Daten...</td>
+                </tr>
+              </tfoot>
+            </table>
           </div>
         </section>
       </main>
@@ -3252,28 +4501,109 @@
         </div>
       </div>
 
+      <!-- TRACKING EDIT MODAL -->
+      <div id="trkEditModal" class="modal-bg">
+        <div class="modal-box trk-modal-box">
+          <div class="fsm-card-header">
+            <div>
+              <div id="trkModalTitle" style="font-size:14.5px; font-weight:600;">Tracking bearbeiten</div>
+              <div id="trkModalSub" style="font-size:11px; opacity:0.86;">Schülerdaten</div>
+            </div>
+            <button type="button" id="btnTrkModalX" class="opt-close-btn">✕</button>
+          </div>
+          <div style="padding:15px; display:flex; flex-direction:column; gap:11px;">
+            <div id="trkEditExpAlert" style="display:none; padding:7px 10px; border-radius:4px; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-text); font-size:12px; font-weight:700;"></div>
+
+            <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+              <div class="field" style="flex:1; min-width:200px;">
+                <span class="field-label">Bereich</span>
+                <select id="trkEditStage" style="font-weight:600;">
+                  <option value="new">🆕 Neue Schüler</option>
+                  <option value="driving">🚗 Bereits am Fahren</option>
+                  <option value="stopped">🛑 Prozess abgebrochen</option>
+                </select>
+              </div>
+              <label style="display:inline-flex; align-items:center; gap:6px; height:32px; font-size:12.5px; font-weight:500; cursor:pointer; user-select:none;">
+                <input type="checkbox" id="trkEditArchived"> 📦 Im FSM inaktiv / archiviert
+              </label>
+            </div>
+
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px;">
+              <div class="field">
+                <span class="field-label">Anmeldedatum</span>
+                <div style="display:flex; gap:4px;">
+                  <input type="date" id="trkEditRegDate" style="flex:1;">
+                  <button type="button" id="btnTrkPullKarteiDate" class="btn btn-outline btn-sm" style="height:32px;" title="Anmeldedatum aus FSM-Kartei übernehmen">📋</button>
+                </div>
+              </div>
+
+              <div class="field" id="trkEditStopDriveWrap">
+                <span class="field-label">Fahren gestoppt am</span>
+                <div style="display:flex; gap:4px;">
+                  <input type="date" id="trkEditStopDrive" style="flex:1;">
+                  <button type="button" id="btnTrkPullLastDrive" class="btn btn-outline btn-sm" style="height:32px;" title="Datum der letzten Fahrstunde aus FSM übernehmen">🚗</button>
+                </div>
+              </div>
+
+              <div class="field" id="trkEditStopProcWrap">
+                <span class="field-label">Prozess abgebrochen am</span>
+                <input type="date" id="trkEditStopProc">
+              </div>
+            </div>
+
+            <div class="field">
+              <span class="field-label">Notizen (Tracking)</span>
+              <textarea id="trkEditNotes" class="dyn-note-textarea" rows="3" placeholder="Notizen zum Stand, Grund für Pause oder Abbruch..."></textarea>
+            </div>
+
+            <div id="trkEditStatus" style="font-size:11.5px; color:var(--text-secondary); min-height:16px;"></div>
+
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding-top:4px; border-top:1px solid var(--border);">
+              <button type="button" id="btnTrkModalDelete" class="btn btn-outline" style="color:var(--err-text); border-color:var(--err-border);">🗑️ Aus Tracking entfernen</button>
+              <div style="display:flex; gap:8px;">
+                <button type="button" id="btnTrkModalCancel" class="btn btn-outline">Abbrechen</button>
+                <button type="button" id="btnTrkModalSave" class="btn btn-petrol">💾 Speichern</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- A4 PRINT SHEET -->
       <div id="printSheet"></div>
     </body>`;
   }
 
   // ============================================================================
-  // TEIL 5/5: PRÜF-CENTER LOGIK (THEORIE, PRAXIS/B197, DRUCK, FILTER & BATCH)
+  // TEIL 5/5: PRÜF-CENTER LOGIK (THEORIE, PRAXIS/B197, DRUCK, TRACKING SUITE)
   // ============================================================================
   function initAppLogic(baseOrigin) {
     appCleanupController = new AbortController();
     const uiSignal = appCleanupController.signal;
 
+    // --- ZENTRALER ZUSTAND (ALLE VARIABLEN VORAB INITIALISIERT) ---
     let allStudents = [];
     let visibleStudents = [];
     let selectedLetter = '';
+    let selectedTopBranch = 'ALL';
     let renderLimit = 150;
     let lastInspected = null;
     const theoryCache = new Map();
     const praxisCache = new Map();
     let batchAbortController = null;
 
-    // 1. Popup Options Menu (Potsdam-Schalter & Dark Mode)
+    // Tracking Suite State
+    let trkSelectedBranch = TrackingManager.getSelectedBranch();
+    let trkActiveStage = 'unassigned'; // 'unassigned' | 'new' | 'driving' | 'stopped'
+    let trkQuickSelectedStudent = null;
+    let trkEditTarget = null;
+    let trkAutoRegAbort = null;
+    let trkManualRegAbort = null;
+    let trkRenderLimit = 150;
+
+    // --------------------------------------------------------------------------
+    // 1. POPUP OPTIONS MENU (POTSDAM-SCHALTER & DARK MODE)
+    // --------------------------------------------------------------------------
     const rootHtml = document.documentElement;
     const btnOptionsMenu = document.getElementById('btnOptionsMenu');
     const optionsBackdrop = document.getElementById('optionsBackdrop');
@@ -3289,7 +4619,7 @@
     const optDarkStatusBadge = document.getElementById('optDarkStatusBadge');
 
     function isPotsdamMode() {
-      return localStorage.getItem('fsm_dynamic_potsdam_mode') === 'true';
+      return DynStorage.getItem('fsm_dynamic_potsdam_mode') === 'true';
     }
 
     function openOptionsMenu() {
@@ -3314,8 +4644,9 @@
     praxisPotsdamStatusBtn.onclick = openOptionsMenu;
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && optionsPopover.classList.contains('open')) {
-        closeOptionsMenu();
+      if (e.key === 'Escape') {
+        if (optionsPopover.classList.contains('open')) closeOptionsMenu();
+        if (trkEditModal.classList.contains('open')) closeTrkEditModal();
       }
     }, { signal: uiSignal });
 
@@ -3338,11 +4669,9 @@
     }
 
     function setPotsdamMode(enabled) {
-      localStorage.setItem('fsm_dynamic_potsdam_mode', enabled ? 'true' : 'false');
+      DynStorage.setItem('fsm_dynamic_potsdam_mode', enabled ? 'true' : 'false');
       syncPotsdamUi(enabled);
-
       praxisCache.forEach((_, sid) => updateRowBadges(sid));
-
       if (lastInspected?.praxis) {
         renderPraxisModuleTab(lastInspected.student, lastInspected.praxis);
       }
@@ -3361,14 +4690,17 @@
         optDarkStatusBadge.className = 'fsm-badge b-open';
         optDarkStatusBadge.textContent = 'Tag';
       }
-      localStorage.setItem('fsm_dynamic_theme', isDark ? 'dark' : 'light');
+      DynStorage.setItem('fsm_dynamic_theme', isDark ? 'dark' : 'light');
     }
 
-    applyTheme(localStorage.getItem('fsm_dynamic_theme') === 'dark');
+    applyTheme(DynStorage.getItem('fsm_dynamic_theme') === 'dark');
     optDarkSwitch.onchange = () => applyTheme(optDarkSwitch.checked);
 
-    // 2. A-Z Alphabet Strip
+    // --------------------------------------------------------------------------
+    // 2. A-Z ALPHABET STRIP & BRANCH FILTER SELECT
+    // --------------------------------------------------------------------------
     const alphabetBar = document.getElementById('alphabetBar');
+    const qBranchSelect = document.getElementById('qBranch');
     const letters = ['Alle', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')];
     letters.forEach(ltr => {
       const b = document.createElement('button');
@@ -3384,17 +4716,50 @@
       alphabetBar.appendChild(b);
     });
 
-    // 3. Module Switching
+    function populateTopBranchSelect() {
+      const branches = TrackingManager.getAllBranches(allStudents);
+      const currentVal = selectedTopBranch;
+      const optionsHtml = [`<option value="ALL">Alle Filialen</option>`];
+      branches.forEach(b => {
+        const lbl = b.label && b.label.toUpperCase() !== b.code ? `${b.code} – ${b.label}` : b.code;
+        optionsHtml.push(`<option value="${escapeHtml(b.code)}">${escapeHtml(lbl)}</option>`);
+      });
+      qBranchSelect.innerHTML = optionsHtml.join('');
+      if (currentVal !== 'ALL' && branches.some(b => b.code === currentVal)) {
+        qBranchSelect.value = currentVal;
+      } else {
+        selectedTopBranch = 'ALL';
+        qBranchSelect.value = 'ALL';
+      }
+    }
+
+    qBranchSelect.onchange = () => {
+      selectedTopBranch = qBranchSelect.value || 'ALL';
+      applyFilters(true);
+    };
+
+    // --------------------------------------------------------------------------
+    // 3. MODULE SWITCHING (1: THEORIE, 2: PRAXIS, 3: KARTEI, 4: TRACKING)
+    // --------------------------------------------------------------------------
     const modTabs = document.querySelectorAll('.mod-tab');
     const sideLinks = document.querySelectorAll('[data-side-mod]');
 
     function switchActiveModule(target) {
-      if (!['theorie', 'praxis', 'dokumente'].includes(target)) target = 'theorie';
+      if (!['theorie', 'praxis', 'dokumente', 'tracking'].includes(target)) target = 'theorie';
       modTabs.forEach(t => t.classList.toggle('active', t.getAttribute('data-mod') === target));
       sideLinks.forEach(a => a.classList.toggle('active-tool', a.getAttribute('data-side-mod') === target));
       document.getElementById('modTheorie').style.display = target === 'theorie' ? 'grid' : 'none';
       document.getElementById('modPraxis').style.display = target === 'praxis' ? 'block' : 'none';
       document.getElementById('modDokumente').style.display = target === 'dokumente' ? 'block' : 'none';
+      document.getElementById('modTracking').style.display = target === 'tracking' ? 'block' : 'none';
+
+      if (target === 'tracking') {
+        renderTrackingSuite();
+      } else if (trkAutoRegAbort) {
+        trkAutoRegAbort.abort();
+        trkAutoRegAbort = null;
+      }
+
       try {
         const url = new URL(location.href);
         url.searchParams.set('mod', target);
@@ -3410,9 +4775,10 @@
     const urlParams = new URLSearchParams(location.search);
     const initialMod = urlParams.get('mod');
     const initialStudentId = urlParams.get('student') ? String(urlParams.get('student')) : null;
-    if (initialMod) switchActiveModule(initialMod);
 
-    // 4. Password-Protected Expert Mode ("Ihsan")
+    // --------------------------------------------------------------------------
+    // 4. PASSWORD-PROTECTED EXPERT MODE ("Ihsan")
+    // --------------------------------------------------------------------------
     const btnModeOffice = document.getElementById('btnModeOffice');
     const btnModeExpert = document.getElementById('btnModeExpert');
     const pwModal = document.getElementById('pwModal');
@@ -3454,15 +4820,17 @@
       if (e.key === 'Escape') pwModal.classList.remove('open');
     });
 
-    // 5. Mandatory Worker Name
+    // --------------------------------------------------------------------------
+    // 5. MANDATORY WORKER NAME (ÜBER DynStorage FÜR NOTIZEN & TRACKING SYNC)
+    // --------------------------------------------------------------------------
     const workerInput = document.getElementById('workerName');
-    const savedWorker = localStorage.getItem('fsm_dynamic_worker_name') || '';
+    const savedWorker = DynStorage.getItem('fsm_dynamic_worker_name') || '';
     if (savedWorker) workerInput.value = savedWorker;
 
     workerInput.addEventListener('input', (e) => {
       e.stopPropagation();
       const val = workerInput.value.trim();
-      localStorage.setItem('fsm_dynamic_worker_name', val);
+      DynStorage.setItem('fsm_dynamic_worker_name', val);
       if (val) workerInput.classList.remove('input-invalid');
     });
 
@@ -3479,7 +4847,9 @@
       return val;
     }
 
-    // 6. Fahrschulwechsler State & 2-Jahres-Fristprüfung (§ 4 Abs. 6 FahrschAusbO)
+    // --------------------------------------------------------------------------
+    // 6. FAHRSCHULWECHSLER STATE & 2-JAHRES-FRISTPRÜFUNG (§ 4 Abs. 6 FahrschAusbO)
+    // --------------------------------------------------------------------------
     const ALL_WECHSLER_KEYS = ['G1','G2','G3','G4','G5','G6','G7','G8','G9','G10','G11','G12','B-1','B-2'];
 
     function formatWechslerLessonLabel(key) {
@@ -3491,7 +4861,7 @@
       const sid = String(studentId || '');
       if (!sid) return { enabled: false, schoolName: '', abnDate: '', lessons: [] };
       try {
-        const raw = localStorage.getItem(`fsm_wechsler_${sid}`);
+        const raw = DynStorage.getItem(`fsm_wechsler_${sid}`);
         if (raw) {
           const parsed = JSON.parse(raw);
           if (!Array.isArray(parsed.lessons)) {
@@ -3521,7 +4891,7 @@
     function saveWechslerData(studentId, data) {
       const sid = String(studentId || '');
       if (!sid) return;
-      localStorage.setItem(`fsm_wechsler_${sid}`, JSON.stringify(data));
+      DynStorage.setItem(`fsm_wechsler_${sid}`, JSON.stringify(data));
     }
 
     function sortWechslerLessons(lessons) {
@@ -3551,36 +4921,18 @@
         if (key.startsWith('G')) {
           const chNum = Number(key.slice(1));
           return {
-            isoDate,
-            datum: datumStr,
-            zeit: zeitStr,
-            min: 90,
-            units: 1,
-            klasse: '',
+            isoDate, datum: datumStr, zeit: zeitStr, min: 90, units: 1, klasse: '',
             kapitel: `${chNum} Grundstoff (Anerkennung Fahrschulwechsel)`,
-            kapNum: chNum,
-            lehrer: schoolLabel,
-            filiale: filialeStr,
-            geloescht: false,
-            isExternal: true,
-            validity
+            kapNum: chNum, lehrer: schoolLabel, filiale: filialeStr,
+            geloescht: false, isExternal: true, validity
           };
         } else {
           const zNum = Number(key.split('-')[1]) || 1;
           return {
-            isoDate,
-            datum: datumStr,
-            zeit: zeitStr,
-            min: 90,
-            units: 1,
-            klasse: 'B',
+            isoDate, datum: datumStr, zeit: zeitStr, min: 90, units: 1, klasse: 'B',
             kapitel: `${zNum} Zusatzstoff Klasse B (Anerkennung Fahrschulwechsel)`,
-            kapNum: zNum,
-            lehrer: schoolLabel,
-            filiale: filialeStr,
-            geloescht: false,
-            isExternal: true,
-            validity
+            kapNum: zNum, lehrer: schoolLabel, filiale: filialeStr,
+            geloescht: false, isExternal: true, validity
           };
         }
       });
@@ -3827,7 +5179,9 @@
       refreshCurrentEvaluation();
     };
 
-    // 7. Auth & Paginated API Helpers
+    // --------------------------------------------------------------------------
+    // 7. AUTH & PAGINATED API HELPERS
+    // --------------------------------------------------------------------------
     fetch(`${baseOrigin}/bff/auth/me`, { headers: API_HEADERS, credentials: 'include', signal: uiSignal })
       .then(r => r.json())
       .then(me => {
@@ -3889,9 +5243,9 @@
       };
     }
 
-    // ==========================================================================
+    // --------------------------------------------------------------------------
     // 8. THEORIE-PARSER & REGELWERK (§ 4 FahrschAusbO)
-    // ==========================================================================
+    // --------------------------------------------------------------------------
     function normalizeTheoryItem(rawItem) {
       const item = (rawItem && typeof rawItem === 'object') ? (rawItem.data || rawItem.d || rawItem) : rawItem;
       if (!item || typeof item !== 'object') {
@@ -3960,7 +5314,6 @@
 
         const isZusatz = Boolean(it.klasse) || (it.kapNum !== null && it.kapNum >= 13);
         if (isZusatz) {
-          // Kapitel 13/14 und B-1/B-2 einheitlich abbilden, um Doppelzählung bei Wechslern zu verhindern
           const normZNum = (it.kapNum !== null && it.kapNum >= 13 && it.kapNum <= 14)
             ? it.kapNum - 12
             : it.kapNum;
@@ -4061,14 +5414,10 @@
         allowed,
         ruleModeLabel: ruleMode === 'erweiterung' ? 'Erweiterung (6 Grund + 2 Zusatz)' : 'Ersterwerb (12 Grund + 2 Zusatz)',
         reasons,
-        effectiveGrundUnits,
-        reqGrund,
-        effectiveZusatzUnits,
-        reqZusatz,
-        grundCounts,
-        grundExtFlags,
-        zusatzCounts,
-        zusatzExtFlags,
+        effectiveGrundUnits, reqGrund,
+        effectiveZusatzUnits, reqZusatz,
+        grundCounts, grundExtFlags,
+        zusatzCounts, zusatzExtFlags,
         allItems,
         extCount: extItems.length,
         validExtCount,
@@ -4108,9 +5457,9 @@
       return result;
     }
 
-    // ==========================================================================
+    // --------------------------------------------------------------------------
     // 9. PRAXIS & PFLICHTFAHRTEN-ANALYSE ENGINE
-    // ==========================================================================
+    // --------------------------------------------------------------------------
     function classifyPraxisType(artStr) {
       const aLower = String(artStr || '').toLowerCase();
       if (aLower.includes('überland') || aLower.includes('ueberland')) return 'ueberland';
@@ -4183,21 +5532,8 @@
       const hasGf = /\/?\bgf\b\.?/i.test(inhalt) || /\/?\bgf\b\.?/i.test(bemerkung);
 
       return {
-        isoDate,
-        sortTs,
-        datum,
-        startTime,
-        zeit,
-        min,
-        kfz,
-        lehrer,
-        klasse,
-        art,
-        pType,
-        bemerkung,
-        betrag,
-        inhalt: inhalt || (hasGf ? '/Gf.' : ''),
-        hasGf,
+        isoDate, sortTs, datum, startTime, zeit, min, kfz, lehrer, klasse, art, pType,
+        bemerkung, betrag, inhalt: inhalt || (hasGf ? '/Gf.' : ''), hasGf,
         geloescht: Boolean(item.geloescht)
       };
     }
@@ -4278,30 +5614,15 @@
 
       for (const it of chronItems) {
         switch (it.pType) {
-          case 'ueberland':
-            ueberlandList.push(it);
-            sonderfahrtenAll.push(it);
-            break;
-          case 'autobahn':
-            autobahnList.push(it);
-            sonderfahrtenAll.push(it);
-            break;
-          case 'nacht':
-            nachtList.push(it);
-            sonderfahrtenAll.push(it);
-            break;
-          case 'testfahrt197':
-            testfahrtB197List.push(it);
-            break;
-          case 'pruefung':
-            pruefungsList.push(it);
-            break;
-          default:
-            uebungsfahrten.push(it);
+          case 'ueberland': ueberlandList.push(it); sonderfahrtenAll.push(it); break;
+          case 'autobahn': autobahnList.push(it); sonderfahrtenAll.push(it); break;
+          case 'nacht': nachtList.push(it); sonderfahrtenAll.push(it); break;
+          case 'testfahrt197': testfahrtB197List.push(it); break;
+          case 'pruefung': pruefungsList.push(it); break;
+          default: uebungsfahrten.push(it);
         }
       }
 
-      // 1. SONDERFAHRTEN-CHECK (inkl. Potsdam-Schalter für AB An-/Abfahrt)
       const uelMin = ueberlandList.reduce((s, x) => s + x.min, 0);
       const uelHas225Block = ueberlandList.some(x => x.min === 225);
       const uelOk = !isNeuerwerber || uelMin >= 225;
@@ -4321,7 +5642,6 @@
 
       const sonderAllOk = uelOk && abOk && nfOk;
 
-      // 2. B197-CHECK
       const testfahrt15 = testfahrtB197List.filter(x => x.min >= 15);
       const schaltKfzSet = new Set(testfahrtB197List.map(x => x.kfz).filter(k => k && k !== '-' && k !== 'AUD'));
       const ninetyMinDrives = uebungsfahrten.filter(x => x.min === 90);
@@ -4337,7 +5657,6 @@
       const b197TestOk = !isB197 || testfahrt15.length >= 1;
       const b197AllOk = b197NinetyOk && b197SixtyOk && b197TestOk;
 
-      // 3. GRUNDFAHRAUFGABEN (/Gf.) & CHRONOLOGIE-VERBOT NACH SONDERFAHRT
       const gfLessons = chronItems.filter(x => x.hasGf);
       const datedSonderfahrten = sonderfahrtenAll.filter(x => x.sortTs > 0);
       const firstSonderfahrt = datedSonderfahrten.length > 0 ? datedSonderfahrten[0] : (sonderfahrtenAll[0] || null);
@@ -4346,10 +5665,7 @@
       if (firstSonderfahrt && firstSonderfahrt.sortTs > 0) {
         for (const gf of gfLessons) {
           if (gf.sortTs > 0 && gf.sortTs > firstSonderfahrt.sortTs) {
-            gfAfterSonderViolations.push({
-              gfLesson: gf,
-              sonderLesson: firstSonderfahrt
-            });
+            gfAfterSonderViolations.push({ gfLesson: gf, sonderLesson: firstSonderfahrt });
           }
         }
       }
@@ -4358,7 +5674,6 @@
       const gfChronologyOk = !isNeuerwerber || gfAfterSonderViolations.length === 0;
       const gfAllOk = gfCountOk && gfChronologyOk;
 
-      // 4. UNGEWÖHNLICHE MINUTENWERTE
       const standardMins = new Set([20, 45, 60, 80, 90, 120, 135, 180]);
       const oddMinuteDrives = uebungsfahrten.filter(x => !standardMins.has(x.min));
 
@@ -4404,20 +5719,14 @@
       }
 
       return {
-        allowed,
-        isNeuerwerber,
-        isB197,
-        potsdamMode,
-        reasons,
+        allowed, isNeuerwerber, isB197, potsdamMode, reasons,
         uelMin, uelHas225Block, uelOk,
         abMin, abHas180Block, twentyMinOnAbDate, twentyMinDrives, abAnAbfahrtOk, abOk,
-        nfMin, nfHas135Block, nfOk,
-        sonderAllOk,
+        nfMin, nfHas135Block, nfOk, sonderAllOk,
         ninetyMinDrives, sixtyMinDrives, sixtyMinOnSchaltKfz, testfahrt15, schaltKfzSet,
         b197NinetyOk, b197SixtyOk, b197TestOk, b197AllOk,
         gfLessons, firstSonderfahrt, gfAfterSonderViolations, gfCountOk, gfChronologyOk, gfAllOk,
-        oddMinuteDrives,
-        pruefungsList
+        oddMinuteDrives, pruefungsList
       };
     }
 
@@ -4639,9 +5948,12 @@
       }
     };
 
+    // --------------------------------------------------------------------------
+    // 10. KARTEI TAB, ZEILEN-BADGES, THEORIE-DETAILS & DRUCKFUNKTIONEN
+    // --------------------------------------------------------------------------
     function renderKarteiModuleTab(student, k) {
       const sid = encodeURIComponent(String(student.id));
-      document.getElementById('karteiTabTitle').textContent = `3. Schüler-Kartei & Büro-Notizen: ${student._nachname}, ${student._vorname} (${student._karteiNr || '—'})`;
+      document.getElementById('karteiTabTitle').textContent = `3. Schüler-Kartei, Notizen & Tracking: ${student._nachname}, ${student._vorname} (${student._karteiNr || '—'})`;
       document.getElementById('karteiTabLinks').innerHTML = `
         <a class="btn btn-outline btn-sm" style="background:#fff; color:#00394d;" href="${baseOrigin}/schueler/${sid}/leistungen" target="_blank">Leistungen öffnen ↗</a>
         <a class="btn btn-outline btn-sm" style="background:#fff; color:#00394d;" href="${baseOrigin}/schueler/${sid}" target="_blank">Stammdaten bearbeiten ↗</a>
@@ -4661,7 +5973,7 @@
 
       const nameCell = rowEl.querySelector('.student-name-cell');
       if (nameCell && studentObj) {
-        nameCell.innerHTML = `${escapeHtml(studentObj._nachname)}, ${escapeHtml(studentObj._vorname)}${NotesManager.badgeHtml(sid)}`;
+        nameCell.innerHTML = `${escapeHtml(studentObj._nachname)}, ${escapeHtml(studentObj._vorname)}${NotesManager.badgeHtml(sid)}${TrackingManager.badgeHtml(sid)}`;
       }
 
       if (th && th.ok) {
@@ -4688,11 +6000,18 @@
     }
 
     appNotesListener = () => {
-      if (lastInspected?.student?.id) {
-        updateRowBadges(lastInspected.student.id);
-      }
+      if (lastInspected?.student?.id) updateRowBadges(lastInspected.student.id);
     };
     NotesManager.listeners.add(appNotesListener);
+
+    appTrackingListener = () => {
+      populateTopBranchSelect();
+      if (lastInspected?.student?.id) updateRowBadges(lastInspected.student.id);
+      if (document.getElementById('modTracking').style.display !== 'none') {
+        renderTrackingSuite();
+      }
+    };
+    TrackingManager.listeners.add(appTrackingListener);
 
     function refreshCurrentEvaluation() {
       if (!lastInspected) return;
@@ -4833,7 +6152,6 @@
           }).join('');
     }
 
-    // 10. DRUCKFUNKTIONEN
     document.getElementById('btnPrintTheory').onclick = () => {
       const workerName = requireWorkerName();
       if (!workerName || !lastInspected?.evalTheory) return;
@@ -4977,12 +6295,1132 @@
       window.print();
     };
 
-    // 11. Student List Filtering & Combined Inspection
+    // --------------------------------------------------------------------------
+    // 11. TAB 4: SCHÜLER-TRACKING SUITE (4 BEREICHE + AUTO-KARTEI-ANMELDEDATUM)
+    // --------------------------------------------------------------------------
+    const trkHeaderTitle = document.getElementById('trkHeaderTitle');
+    const trkBranchBar = document.getElementById('trkBranchBar');
+    const trkSubtabs = document.querySelectorAll('.trk-subtab');
+    const trkCntUnassigned = document.getElementById('trkCntUnassigned');
+    const trkCntNew = document.getElementById('trkCntNew');
+    const trkCntDriving = document.getElementById('trkCntDriving');
+    const trkCntStopped = document.getElementById('trkCntStopped');
+    const trkExpiredBadge = document.getElementById('trkExpiredBadge');
+    const trkArchivedBadge = document.getElementById('trkArchivedBadge');
+
+    const trkAssignSearch = document.getElementById('trkAssignSearch');
+    const trkAssignDropdown = document.getElementById('trkAssignDropdown');
+    const trkAssignStage = document.getElementById('trkAssignStage');
+    const trkAssignRegDate = document.getElementById('trkAssignRegDate');
+    const trkAssignNote = document.getElementById('trkAssignNote');
+    const btnTrkQuickAssign = document.getElementById('btnTrkQuickAssign');
+
+    const trkSearchInput = document.getElementById('trkSearchInput');
+    const trkSortSelect = document.getElementById('trkSortSelect');
+    const trkShowArchived = document.getElementById('trkShowArchived');
+    const trkOnlyExpired = document.getElementById('trkOnlyExpired');
+    const trkStatusBanner = document.getElementById('trkStatusBanner');
+    const trkStatusText = document.getElementById('trkStatusText');
+    const btnTrkJumpAction = document.getElementById('btnTrkJumpAction');
+    const btnTrkStopRegFetch = document.getElementById('btnTrkStopRegFetch');
+    const trkUrlBar = document.getElementById('trkUrlBar');
+    const trkUrlInput = document.getElementById('trkUrlInput');
+    const trkThead = document.getElementById('trkThead');
+    const trkTbody = document.getElementById('trkTbody');
+    const trkFootText = document.getElementById('trkFootText');
+
+    // Edit Modal Refs
+    const trkEditModal = document.getElementById('trkEditModal');
+    const trkModalTitle = document.getElementById('trkModalTitle');
+    const trkModalSub = document.getElementById('trkModalSub');
+    const trkEditExpAlert = document.getElementById('trkEditExpAlert');
+    const trkEditStage = document.getElementById('trkEditStage');
+    const trkEditArchived = document.getElementById('trkEditArchived');
+    const trkEditRegDate = document.getElementById('trkEditRegDate');
+    const trkEditStopDriveWrap = document.getElementById('trkEditStopDriveWrap');
+    const trkEditStopDrive = document.getElementById('trkEditStopDrive');
+    const trkEditStopProcWrap = document.getElementById('trkEditStopProcWrap');
+    const trkEditStopProc = document.getElementById('trkEditStopProc');
+    const trkEditNotes = document.getElementById('trkEditNotes');
+    const trkEditStatus = document.getElementById('trkEditStatus');
+    const btnTrkPullKarteiDate = document.getElementById('btnTrkPullKarteiDate');
+    const btnTrkPullLastDrive = document.getElementById('btnTrkPullLastDrive');
+    const btnTrkModalSave = document.getElementById('btnTrkModalSave');
+    const btnTrkModalDelete = document.getElementById('btnTrkModalDelete');
+
+    [trkAssignSearch, trkAssignRegDate, trkAssignNote, trkSearchInput, trkUrlInput, trkEditRegDate, trkEditStopDrive, trkEditStopProc, trkEditNotes].forEach(isolateKeys);
+
+    function setTrkStatus(msg, type = 'info', showStopBtn = false, jumpAction = null) {
+      if (!msg) {
+        trkStatusBanner.className = 'trk-status-strip';
+        trkStatusText.textContent = '';
+        btnTrkStopRegFetch.style.display = 'none';
+        btnTrkJumpAction.style.display = 'none';
+        btnTrkJumpAction.onclick = null;
+        return;
+      }
+      trkStatusBanner.className = `trk-status-strip show ${type === 'err' ? 'is-err' : (type === 'ok' ? 'is-ok' : '')}`;
+      trkStatusText.textContent = msg;
+      btnTrkStopRegFetch.style.display = showStopBtn ? 'inline-flex' : 'none';
+      if (jumpAction && jumpAction.label && typeof jumpAction.onClick === 'function') {
+        btnTrkJumpAction.textContent = jumpAction.label;
+        btnTrkJumpAction.style.display = 'inline-flex';
+        btnTrkJumpAction.onclick = jumpAction.onClick;
+      } else {
+        btnTrkJumpAction.style.display = 'none';
+        btnTrkJumpAction.onclick = null;
+      }
+    }
+
+    function openTrkUrlConfig() {
+      trkUrlInput.value = NotesManager.getEndpoint();
+      trkUrlBar.style.display = 'flex';
+      trkUrlInput.focus();
+      trkUrlInput.select();
+    }
+
+    document.getElementById('btnTrkSheetUrl').onclick = () => {
+      if (trkUrlBar.style.display === 'flex') trkUrlBar.style.display = 'none';
+      else openTrkUrlConfig();
+    };
+    document.getElementById('btnTrkUrlCancel').onclick = () => { trkUrlBar.style.display = 'none'; };
+    document.getElementById('btnTrkUrlSave').onclick = async () => {
+      const clean = trkUrlInput.value.trim();
+      if (clean && !clean.startsWith('https://script.google.com')) {
+        setTrkStatus('⚠️ Die URL muss mit https://script.google.com/macros/s/... beginnen.', 'err', false);
+        return;
+      }
+      NotesManager.setEndpoint(clean);
+      TrackingManager.backendStatus = 'unknown';
+      trkUrlBar.style.display = 'none';
+      if (!clean) {
+        setTrkStatus('Lokaler Speicher aktiv (keine Google-Sheet-URL hinterlegt).', 'info', false);
+        return;
+      }
+      setTrkStatus('↻ Prüfe Verbindung zum neuen Google Sheet...', 'info', false);
+      await TrackingManager.syncAll(true);
+      if (TrackingManager.backendStatus === 'ok') {
+        setTrkStatus('✓ Google Sheet (v6.1 Tracking + Notizen) erfolgreich verbunden!', 'ok', false);
+      } else {
+        setTrkStatus('⚠️ URL gespeichert, aber das Apps Script antwortet noch ohne Tracking-Daten. Bitte in Apps Script „Bereitstellen → Bereitstellungen verwalten → Neue Version“ prüfen.', 'err', false, {
+          label: '⚙️ URL ändern',
+          onClick: openTrkUrlConfig
+        });
+      }
+      renderTrackingSuite();
+    };
+
+    function matchesTrkBranch(branchCode) {
+      if (trkSelectedBranch === 'ALL') return true;
+      return String(branchCode || '').toUpperCase() === trkSelectedBranch;
+    }
+
+    function getUnassignedStudents(branchFilter = trkSelectedBranch) {
+      return allStudents.filter(s => {
+        if (TrackingManager.get(s.id)) return false;
+        if (branchFilter !== 'ALL' && s._branch !== branchFilter) return false;
+        return true;
+      });
+    }
+
+    function renderTrkBranchBar() {
+      const branches = TrackingManager.getAllBranches(allStudents);
+      const allTracked = TrackingManager.getAll();
+
+      if (trkSelectedBranch !== 'ALL' && !branches.some(b => b.code === trkSelectedBranch)) {
+        trkSelectedBranch = 'ALL';
+        TrackingManager.setSelectedBranch('ALL');
+      }
+
+      const countFor = (code) => {
+        if (trkActiveStage === 'unassigned') {
+          return allStudents.filter(s => !TrackingManager.get(s.id) && (code === 'ALL' || s._branch === code)).length;
+        }
+        return allTracked.filter(e => e.stage === trkActiveStage && (code === 'ALL' || (e.branch || extractBranchCode(e.karteiNr)) === code)).length;
+      };
+
+      const buttonsHtml = [`<span class="trk-branch-lbl"><i class="material-icons" style="font-size:15px;">storefront</i> Filiale:</span>`];
+      buttonsHtml.push(`
+        <button type="button" class="trk-branch-btn ${trkSelectedBranch === 'ALL' ? 'active' : ''}" data-branch="ALL">
+          <span>Alle Filialen</span>
+          <span class="trk-branch-cnt">${countFor('ALL')}</span>
+        </button>
+      `);
+
+      branches.forEach(b => {
+        const lbl = TrackingManager.getBranchLabel(b.code);
+        buttonsHtml.push(`
+          <button type="button" class="trk-branch-btn ${trkSelectedBranch === b.code ? 'active' : ''}" data-branch="${escapeHtml(b.code)}">
+            <span>${escapeHtml(lbl)}</span>
+            <span class="trk-branch-cnt">${countFor(b.code)}</span>
+          </button>
+        `);
+      });
+
+      trkBranchBar.innerHTML = buttonsHtml.join('');
+      trkBranchBar.querySelectorAll('.trk-branch-btn').forEach(btn => {
+        btn.onclick = () => {
+          trkSelectedBranch = btn.getAttribute('data-branch') || 'ALL';
+          TrackingManager.setSelectedBranch(trkSelectedBranch);
+          trkRenderLimit = 150;
+          renderTrackingSuite();
+        };
+      });
+
+      const activeBranchLabel = trkSelectedBranch === 'ALL'
+        ? 'Alle Filialen'
+        : TrackingManager.getBranchLabel(trkSelectedBranch);
+      trkHeaderTitle.textContent = `4. Schüler-Tracking Suite — ${activeBranchLabel} (Google Sheets Sync)`;
+    }
+
+    // Aktualisiert Datum + >2-Jahre-Warnung direkt in der DOM-Zeile ohne Fokus-/Notizverlust
+    function patchUnassignedRowRegDate(sid, isoDate) {
+      const row = trkTbody.querySelector(`tr[data-unassigned-id="${CSS.escape(sid)}"]`);
+      if (!row) return;
+      const inp = row.querySelector('.trk-unassigned-reg');
+      if (inp && !inp.value && isoDate) {
+        inp.value = isoDate;
+      }
+      const effectiveDate = inp ? inp.value : isoDate;
+      const exp = checkRegistrationExpiry(effectiveDate);
+      row.classList.toggle('trk-row-expired', exp.isExpired);
+      const badgeCell = row.querySelector('.trk-unassigned-status');
+      if (badgeCell) {
+        if (exp.isExpired) {
+          badgeCell.innerHTML = `<span class="fsm-badge b-no" title="${escapeHtml(exp.label)}">⚠️ &gt;2 J.</span>`;
+        } else if (exp.isExpiring) {
+          badgeCell.innerHTML = `<span class="fsm-badge b-warn" title="${escapeHtml(exp.label)}">⏳ ${exp.daysLeft} T.</span>`;
+        } else if (effectiveDate) {
+          badgeCell.innerHTML = `<span class="fsm-badge b-yes">✓ Aktiv</span>`;
+        } else {
+          badgeCell.innerHTML = `<span class="fsm-badge b-open">Offen</span>`;
+        }
+      }
+    }
+
+    // Lädt fehlende Kartei-Anmeldedaten für alle sichtbaren "Nicht zugeordnet"-Schüler gedrosselt im Hintergrund
+    async function autoLoadUnassignedRegDates(studentsSlice) {
+      if (trkAutoRegAbort) {
+        trkAutoRegAbort.abort();
+        trkAutoRegAbort = null;
+      }
+      if (trkManualRegAbort || !Array.isArray(studentsSlice) || studentsSlice.length === 0) return;
+
+      const targets = studentsSlice
+        .filter(s => !StudentStore.getKnownRegDate(s) && !RegDateCache.getEntry(s.id));
+      if (targets.length === 0) return;
+
+      const ctrl = new AbortController();
+      trkAutoRegAbort = ctrl;
+      let idx = 0;
+      let done = 0;
+      let found = 0;
+
+      setTrkStatus(`📅 Lade Anmeldedaten aus FSM-Karteien (${done}/${targets.length})...`, 'info', true);
+
+      async function worker() {
+        while (idx < targets.length && !ctrl.signal.aborted && !uiSignal.aborted) {
+          const s = targets[idx++];
+          try {
+            const k = await StudentStore.fetchKartei(s.id);
+            const iso = extractRegistrationDate(k);
+            if (iso) {
+              found++;
+              s._regDate = iso;
+            }
+            if (!ctrl.signal.aborted) {
+              patchUnassignedRowRegDate(s.id, iso);
+            }
+          } catch (e) {
+            if (!ctrl.signal.aborted) {
+              patchUnassignedRowRegDate(s.id, '');
+            }
+          }
+          done++;
+          if (!ctrl.signal.aborted) {
+            setTrkStatus(`📅 Lade Anmeldedaten aus FSM-Karteien (${done}/${targets.length} · ${found} gefunden)...`, 'info', true);
+          }
+        }
+      }
+
+      try {
+        await Promise.all(Array.from({ length: 5 }, () => worker()));
+      } finally {
+        if (trkAutoRegAbort === ctrl) {
+          trkAutoRegAbort = null;
+          if (!ctrl.signal.aborted) {
+            setTrkStatus(`✓ Anmeldedaten geladen (${found} von ${targets.length} aus Kartei übernommen).`, 'ok', false);
+            setTimeout(() => {
+              if (!trkAutoRegAbort && !trkManualRegAbort) setTrkStatus('');
+            }, 3500);
+          } else {
+            trkTbody.querySelectorAll('.trk-unassigned-status').forEach(cell => {
+              if (cell.textContent.trim() === 'Lädt…') {
+                cell.innerHTML = `<span class="fsm-badge b-open">Offen</span>`;
+              }
+            });
+            setTrkStatus('');
+          }
+        }
+      }
+    }
+
+    function renderTrackingSuite() {
+      renderTrkBranchBar();
+
+      const allTracked = TrackingManager.getAll();
+      const inBranchTracked = allTracked.filter(e => matchesTrkBranch(e.branch || extractBranchCode(e.karteiNr)));
+      const inBranchUnassigned = getUnassignedStudents(trkSelectedBranch);
+
+      const cntNew = inBranchTracked.filter(e => e.stage === 'new').length;
+      const cntDriving = inBranchTracked.filter(e => e.stage === 'driving').length;
+      const cntStopped = inBranchTracked.filter(e => e.stage === 'stopped').length;
+
+      trkCntUnassigned.textContent = String(inBranchUnassigned.length);
+      trkCntNew.textContent = String(cntNew);
+      trkCntDriving.textContent = String(cntDriving);
+      trkCntStopped.textContent = String(cntStopped);
+
+      trkSubtabs.forEach(tab => {
+        tab.classList.toggle('active', tab.getAttribute('data-trk-stage') === trkActiveStage);
+      });
+
+      const expiredCount = inBranchTracked.filter(e => checkRegistrationExpiry(e.registrationDate).isExpired).length;
+      const archivedCount = inBranchTracked.filter(e => e.isArchived).length;
+      trkExpiredBadge.style.display = expiredCount > 0 ? 'inline-flex' : 'none';
+      trkExpiredBadge.textContent = `⚠️ ${expiredCount} >2 J.`;
+      trkArchivedBadge.style.display = archivedCount > 0 ? 'inline-flex' : 'none';
+      trkArchivedBadge.textContent = `📦 ${archivedCount} Archiv`;
+
+      // FSM-Serverfehler (z. B. 504 Timeout) direkt sichtbar machen
+      if (StudentStore.lastError && allStudents.length === 0) {
+        setTrkStatus(`⚠️ Fahrschulmanager-Server antwortet nicht (${StudentStore.lastError}). Bitte oben auf „↻ Sync“ klicken.`, 'err', false);
+      } else if (TrackingManager.backendStatus === 'outdated' && !trkAutoRegAbort && !trkManualRegAbort && !trkStatusText.textContent) {
+        setTrkStatus(
+          '⚠️ Hinweis: Deine Google-Sheet-URL nutzt noch das alte Apps Script (nur Notizen). Zuweisungen bleiben lokal erhalten — bitte in Apps Script „Bereitstellen → Bereitstellungen verwalten → Neue Version“ veröffentlichen oder neue URL eintragen.',
+          'err',
+          false,
+          { label: '⚙️ Sheet-URL anpassen', onClick: openTrkUrlConfig }
+        );
+      }
+
+      const query = (trkSearchInput.value || '').trim().toLowerCase();
+      const sortMode = trkSortSelect.value || 'kartei';
+      const showArchived = trkShowArchived.checked;
+      const onlyExpired = trkOnlyExpired.checked;
+
+      // ---- FALL A: TAB "NICHT ZUGEORDNET" (ALLE FSM-SCHÜLER ZUM DURCHGEHEN) ----
+      if (trkActiveStage === 'unassigned') {
+        trkThead.innerHTML = `
+          <tr>
+            <th style="width:105px;">Kartei-Nr.</th>
+            <th style="width:65px;">Filiale</th>
+            <th>Name, Vorname</th>
+            <th style="width:80px;">Klasse</th>
+            <th style="width:138px;">Anmeldedatum (Kartei)</th>
+            <th style="width:92px;">Status</th>
+            <th>Notiz (optional)</th>
+            <th style="width:265px; text-align:right;">Direkt zuordnen</th>
+          </tr>
+        `;
+
+        let list = inBranchUnassigned.filter(s => {
+          if (!showArchived && s._isActive === false) return false;
+          const knownReg = StudentStore.getKnownRegDate(s);
+          if (onlyExpired && !checkRegistrationExpiry(knownReg).isExpired) return false;
+          if (query) {
+            const hay = `${s._karteiNr} ${s._branch} ${s._nachname} ${s._vorname} ${s._klassenStr}`.toLowerCase();
+            if (!hay.includes(query)) return false;
+          }
+          return true;
+        });
+
+        list.sort((a, b) => {
+          if (sortMode === 'name') {
+            return `${a._nachname} ${a._vorname}`.localeCompare(`${b._nachname} ${b._vorname}`, 'de');
+          }
+          if (sortMode === 'reg_asc' || sortMode === 'reg_desc') {
+            const da = StudentStore.getKnownRegDate(a) || (sortMode === 'reg_asc' ? '9999-99-99' : '0000-00-00');
+            const db = StudentStore.getKnownRegDate(b) || (sortMode === 'reg_asc' ? '9999-99-99' : '0000-00-00');
+            return sortMode === 'reg_asc' ? da.localeCompare(db) : db.localeCompare(da);
+          }
+          return a._karteiNr.localeCompare(b._karteiNr, 'de', { numeric: true });
+        });
+
+        if (list.length === 0) {
+          trkTbody.innerHTML = `
+            <tr>
+              <td colspan="8" style="padding:18px; text-align:center; color:var(--text-muted);">
+                ${allStudents.length === 0
+                  ? 'Keine Schüler vom FSM geladen. Klicke oben auf „↻ Sync“.'
+                  : '🎉 Alle Schüler dieser Auswahl sind bereits im Tracking zugeordnet (oder passen nicht zum Filter)!'}
+              </td>
+            </tr>
+          `;
+          trkFootText.textContent = `0 nicht zugeordnete Schüler angezeigt`;
+          return;
+        }
+
+        const slice = list.slice(0, trkRenderLimit);
+        trkTbody.innerHTML = slice.map(s => {
+          const sid = String(s.id);
+          const regIso = StudentStore.getKnownRegDate(s);
+          const exp = checkRegistrationExpiry(regIso);
+          const hasCacheEntry = Boolean(RegDateCache.getEntry(sid));
+          const rowClasses = [];
+          if (exp.isExpired) rowClasses.push('trk-row-expired');
+          if (s._isActive === false) rowClasses.push('trk-row-archived');
+
+          const statusHtml = exp.isExpired
+            ? `<span class="fsm-badge b-no" title="${escapeHtml(exp.label)}">⚠️ &gt;2 J.</span>`
+            : (exp.isExpiring
+                ? `<span class="fsm-badge b-warn" title="${escapeHtml(exp.label)}">⏳ ${exp.daysLeft} T.</span>`
+                : (regIso
+                    ? `<span class="fsm-badge b-yes">✓ Aktiv</span>`
+                    : (hasCacheEntry
+                        ? `<span class="fsm-badge b-open">Offen</span>`
+                        : `<span class="fsm-badge b-open">Lädt…</span>`)));
+
+          return `
+            <tr data-unassigned-id="${escapeHtml(sid)}" class="${rowClasses.join(' ')}">
+              <td><strong>${escapeHtml(s._karteiNr || '—')}</strong></td>
+              <td><span class="fsm-badge b-ext">${escapeHtml(s._branch || '—')}</span></td>
+              <td style="font-weight:500;">${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}${NotesManager.badgeHtml(sid)}</td>
+              <td>${escapeHtml(s._klassenStr || '—')}</td>
+              <td><input type="date" class="trk-inline-date trk-unassigned-reg" value="${escapeHtml(regIso)}"></td>
+              <td class="trk-unassigned-status">${statusHtml}</td>
+              <td><input type="text" class="trk-inline-note trk-unassigned-note" placeholder="Notiz..."></td>
+              <td style="text-align:right;">
+                <div style="display:inline-flex; gap:3px; align-items:center;">
+                  <button type="button" class="btn btn-petrol btn-sm btn-quick-stage" data-stage="new" title="Als Neuer Schüler zuordnen">🆕 Neu</button>
+                  <button type="button" class="btn btn-outline btn-sm btn-quick-stage" data-stage="driving" title="Als Bereits am Fahren zuordnen">🚗 Fährt</button>
+                  <button type="button" class="btn btn-outline btn-sm btn-quick-stage" data-stage="stopped" title="Als Prozess abgebrochen zuordnen">🛑 Abgebr.</button>
+                  <button type="button" class="btn btn-outline btn-sm btn-unassigned-kartei" title="Kartei öffnen">📋</button>
+                </div>
+              </td>
+            </tr>
+          `;
+        }).join('');
+
+        // Events für jede Nicht-zugeordnet-Zeile binden
+        trkTbody.querySelectorAll('tr[data-unassigned-id]').forEach(tr => {
+          const sid = tr.getAttribute('data-unassigned-id');
+          const student = slice.find(x => x.id === sid);
+          if (!student) return;
+
+          const regInp = tr.querySelector('.trk-unassigned-reg');
+          const noteInp = tr.querySelector('.trk-unassigned-note');
+          isolateKeys(regInp);
+          isolateKeys(noteInp);
+
+          regInp.onchange = () => patchUnassignedRowRegDate(sid, regInp.value);
+
+          tr.querySelector('.btn-unassigned-kartei').onclick = (e) => {
+            e.stopPropagation();
+            inspectStudentObject(student, 'dokumente', true);
+          };
+
+          tr.querySelectorAll('.btn-quick-stage').forEach(btn => {
+            btn.onclick = async (e) => {
+              e.stopPropagation();
+              const targetStage = btn.getAttribute('data-stage');
+              const allRowBtns = tr.querySelectorAll('button');
+              const origLabel = btn.textContent;
+              allRowBtns.forEach(b => { b.disabled = true; });
+              btn.textContent = '⏳';
+
+              try {
+                let regDateVal = regInp.value || StudentStore.getKnownRegDate(student);
+                if (!regDateVal && !RegDateCache.getEntry(sid)) {
+                  try {
+                    const k = await StudentStore.fetchKartei(sid);
+                    regDateVal = extractRegistrationDate(k);
+                  } catch (err) {}
+                }
+                const saved = await TrackingManager.save(student, {
+                  stage: targetStage,
+                  registrationDate: regDateVal,
+                  notes: noteInp.value.trim(),
+                  isArchived: student._isActive === false
+                });
+                const stageLabel = TrackingManager.STAGES[targetStage].label;
+                if (saved?.outdatedBackend) {
+                  setTrkStatus(
+                    `⚠️ ${student._nachname}, ${student._vorname} → lokal in „${stageLabel}“ verschoben. Google Sheet läuft noch auf der alten Script-Version (bitte neue Version bereitstellen oder URL anpassen)!`,
+                    'err',
+                    false,
+                    { label: `→ Zu „${stageLabel}“`, onClick: () => { trkActiveStage = targetStage; renderTrackingSuite(); } }
+                  );
+                } else {
+                  setTrkStatus(
+                    `✓ ${student._nachname}, ${student._vorname} → „${stageLabel}“ gespeichert.`,
+                    'ok',
+                    false,
+                    { label: `→ Zu „${stageLabel}“`, onClick: () => { trkActiveStage = targetStage; renderTrackingSuite(); } }
+                  );
+                }
+              } catch (err) {
+                setTrkStatus(`⚠️ Fehler beim Speichern: ${err.message}`, 'err', false);
+                allRowBtns.forEach(b => { b.disabled = false; });
+                btn.textContent = origLabel;
+              }
+            };
+          });
+        });
+
+        trkFootText.innerHTML = list.length > slice.length
+          ? `Zeige ${slice.length} von ${list.length} nicht zugeordneten Schülern · <button type="button" id="btnTrkShowMore" class="btn btn-outline btn-sm">Alle ${list.length} anzeigen</button>`
+          : `Summe nicht zugeordneter Schüler: ${list.length} (Anmeldedaten werden automatisch aus der FSM-Kartei geladen)`;
+
+        const moreBtn = document.getElementById('btnTrkShowMore');
+        if (moreBtn) {
+          moreBtn.onclick = () => {
+            trkRenderLimit = Infinity;
+            renderTrackingSuite();
+          };
+        }
+
+        // Hintergrund-Laden der Anmeldedaten für die angezeigten Zeilen starten
+        autoLoadUnassignedRegDates(slice);
+        return;
+      }
+
+      // ---- FALL B: DIE 3 TRACKING-BEREICHE (new / driving / stopped) ----
+      if (trkAutoRegAbort) {
+        trkAutoRegAbort.abort();
+        trkAutoRegAbort = null;
+      }
+
+      const showStopDriveCol = trkActiveStage === 'driving' || trkActiveStage === 'stopped';
+      const showStopProcCol = trkActiveStage === 'stopped';
+
+      trkThead.innerHTML = `
+        <tr>
+          <th style="width:105px;">Kartei-Nr.</th>
+          <th style="width:65px;">Filiale</th>
+          <th>Name, Vorname</th>
+          <th style="width:75px;">Klasse</th>
+          <th style="width:125px;">Anmeldedatum</th>
+          ${showStopDriveCol ? `<th style="width:125px;">Fahren gestoppt</th>` : ''}
+          ${showStopProcCol ? `<th style="width:120px;">Abgebrochen am</th>` : ''}
+          <th>Notizen</th>
+          <th style="width:135px;">Bereich wechseln</th>
+          <th style="width:155px; text-align:right;">Aktion</th>
+        </tr>
+      `;
+
+      let entries = inBranchTracked.filter(e => {
+        if (e.stage !== trkActiveStage) return false;
+        if (!showArchived && e.isArchived) return false;
+        const exp = checkRegistrationExpiry(e.registrationDate);
+        if (onlyExpired && !exp.isExpired) return false;
+        if (query) {
+          const hay = `${e.karteiNr} ${e.branch} ${e.name} ${e.klassen} ${e.notes} ${e.updatedBy}`.toLowerCase();
+          if (!hay.includes(query)) return false;
+        }
+        return true;
+      });
+
+      entries.sort((a, b) => {
+        if (sortMode === 'name') return a.name.localeCompare(b.name, 'de');
+        if (sortMode === 'reg_asc') return (a.registrationDate || '9999-99-99').localeCompare(b.registrationDate || '9999-99-99');
+        if (sortMode === 'reg_desc') return (b.registrationDate || '0000-00-00').localeCompare(a.registrationDate || '0000-00-00');
+        if (sortMode === 'updated') return (b.updatedAt || '').localeCompare(a.updatedAt || '');
+        const brCmp = (a.branch || '').localeCompare(b.branch || '', 'de');
+        if (brCmp !== 0) return brCmp;
+        return (a.karteiNr || '').localeCompare(b.karteiNr || '', 'de', { numeric: true });
+      });
+
+      const colSpan = 8 + (showStopDriveCol ? 1 : 0) + (showStopProcCol ? 1 : 0);
+
+      if (entries.length === 0) {
+        trkTbody.innerHTML = `
+          <tr>
+            <td colspan="${colSpan}" style="padding:18px; text-align:center; color:var(--text-muted);">
+              Keine Einträge in „${escapeHtml(TrackingManager.STAGES[trkActiveStage]?.label || trkActiveStage)}“ für diese Filial-/Filter-Auswahl.
+            </td>
+          </tr>
+        `;
+        trkFootText.textContent = `0 Einträge angezeigt`;
+        return;
+      }
+
+      trkTbody.innerHTML = entries.map(e => {
+        const exp = checkRegistrationExpiry(e.registrationDate);
+        const rowClasses = [];
+        if (exp.isExpired) rowClasses.push('trk-row-expired');
+        if (e.isArchived) rowClasses.push('trk-row-archived');
+
+        const regBadge = exp.isExpired
+          ? `<div style="font-size:10.5px; font-weight:700; color:var(--err-text);">⚠️ Vertrag &gt;2 J.</div>`
+          : (exp.isExpiring
+              ? `<div style="font-size:10.5px; color:var(--warn-text);">⏳ noch ${exp.daysLeft} T.</div>`
+              : '');
+
+        const archBadge = e.isArchived
+          ? `<span class="dyn-trk-pill trk-archived" title="Im FSM inaktiv / Buchhaltung fertig">📦 Archiv</span>`
+          : '';
+
+        return `
+          <tr data-trk-id="${escapeHtml(e.studentId)}" class="${rowClasses.join(' ')}">
+            <td><strong>${escapeHtml(e.karteiNr || '—')}</strong></td>
+            <td><span class="fsm-badge b-ext">${escapeHtml(e.branch || extractBranchCode(e.karteiNr) || '—')}</span></td>
+            <td style="font-weight:500;">${escapeHtml(e.name || '—')}${archBadge}${NotesManager.badgeHtml(e.studentId)}</td>
+            <td>${escapeHtml(e.klassen || '—')}</td>
+            <td>
+              <div>${e.registrationDate ? escapeHtml(formatGermanDate(e.registrationDate)) : '<span style="color:var(--text-muted);">—</span>'}</div>
+              ${regBadge}
+            </td>
+            ${showStopDriveCol ? `<td>${e.stoppedDrivingDate ? escapeHtml(formatGermanDate(e.stoppedDrivingDate)) : '<span style="color:var(--text-muted);">—</span>'}</td>` : ''}
+            ${showStopProcCol ? `<td>${e.processStoppedDate ? escapeHtml(formatGermanDate(e.processStoppedDate)) : '<span style="color:var(--text-muted);">—</span>'}</td>` : ''}
+            <td class="trk-note-cell">${e.notes ? escapeHtml(e.notes) : '<span style="color:var(--text-muted);">—</span>'}</td>
+            <td>
+              <select class="trk-stage-select">
+                <option value="new" ${e.stage === 'new' ? 'selected' : ''}>🆕 Neu</option>
+                <option value="driving" ${e.stage === 'driving' ? 'selected' : ''}>🚗 Fährt</option>
+                <option value="stopped" ${e.stage === 'stopped' ? 'selected' : ''}>🛑 Abgebr.</option>
+              </select>
+            </td>
+            <td style="text-align:right;">
+              <div style="display:inline-flex; gap:4px; align-items:center;">
+                <button type="button" class="btn btn-petrol btn-sm btn-trk-edit" title="Datum, Notizen & Status bearbeiten">✏️ Bearb.</button>
+                <button type="button" class="btn btn-outline btn-sm btn-trk-kartei" title="Schüler-Kartei öffnen">📋</button>
+                <button type="button" class="btn btn-outline btn-sm btn-trk-praxis" title="Pflichtfahrten prüfen">🚗</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      // Events der Tracking-Zeilen binden
+      trkTbody.querySelectorAll('tr[data-trk-id]').forEach(tr => {
+        const sid = tr.getAttribute('data-trk-id');
+        const entry = entries.find(x => x.studentId === sid);
+        if (!entry) return;
+
+        const stageSel = tr.querySelector('.trk-stage-select');
+        stageSel.onclick = (ev) => ev.stopPropagation();
+        stageSel.onchange = async () => {
+          const nextStage = stageSel.value;
+          stageSel.disabled = true;
+          try {
+            await TrackingManager.save(entry, { stage: nextStage });
+            setTrkStatus(`✓ ${entry.name} → „${TrackingManager.STAGES[nextStage].label}“ verschoben.`, 'ok', false);
+          } catch (err) {
+            setTrkStatus(`⚠️ Fehler beim Verschieben: ${err.message}`, 'err', false);
+            stageSel.value = entry.stage;
+          } finally {
+            stageSel.disabled = false;
+          }
+        };
+
+        tr.querySelector('.btn-trk-edit').onclick = (ev) => {
+          ev.stopPropagation();
+          openTrkEditModal(entry);
+        };
+        tr.ondblclick = () => openTrkEditModal(entry);
+
+        const openLinkedStudent = (tab) => {
+          const found = allStudents.find(s => s.id === sid) || {
+            id: sid,
+            _karteiNr: entry.karteiNr,
+            _nachname: entry.name.split(',')[0]?.trim() || entry.name,
+            _vorname: entry.name.split(',')[1]?.trim() || '',
+            _klassenStr: entry.klassen,
+            _branch: entry.branch,
+            _isActive: !entry.isArchived
+          };
+          inspectStudentObject(found, tab, true);
+        };
+
+        tr.querySelector('.btn-trk-kartei').onclick = (ev) => { ev.stopPropagation(); openLinkedStudent('dokumente'); };
+        tr.querySelector('.btn-trk-praxis').onclick = (ev) => { ev.stopPropagation(); openLinkedStudent('praxis'); };
+      });
+
+      const expShown = entries.filter(e => checkRegistrationExpiry(e.registrationDate).isExpired).length;
+      const archShown = entries.filter(e => e.isArchived).length;
+      trkFootText.textContent = `Angezeigt: ${entries.length} Schüler · Davon ${expShown} über 2 Jahre (rot) · ${archShown} archiviert (grau)`;
+    }
+
+    // Sub-Tab-Wechsel
+    trkSubtabs.forEach(tab => {
+      tab.onclick = () => {
+        trkActiveStage = tab.getAttribute('data-trk-stage') || 'unassigned';
+        trkRenderLimit = 150;
+        if (trkActiveStage !== 'unassigned') {
+          trkAssignStage.value = trkActiveStage;
+        }
+        renderTrackingSuite();
+      };
+    });
+
+    trkSearchInput.addEventListener('input', debounce(() => renderTrackingSuite(), 120));
+    trkSortSelect.onchange = () => renderTrackingSuite();
+    trkShowArchived.onchange = () => renderTrackingSuite();
+    trkOnlyExpired.onchange = () => renderTrackingSuite();
+
+    // Stopp-Button für Anmeldedaten-Batch
+    btnTrkStopRegFetch.onclick = () => {
+      if (trkAutoRegAbort) trkAutoRegAbort.abort();
+      if (trkManualRegAbort) trkManualRegAbort.abort();
+    };
+
+    // Button "📅 Anmeldedaten laden" (lädt fehlende Kartei-Anmeldedaten je nach aktuellem Sub-Tab)
+    document.getElementById('btnTrkFetchRegDates').onclick = async () => {
+      if (trkManualRegAbort) return;
+      if (trkAutoRegAbort) {
+        trkAutoRegAbort.abort();
+        trkAutoRegAbort = null;
+      }
+
+      const btn = document.getElementById('btnTrkFetchRegDates');
+      btn.disabled = true;
+      const ctrl = new AbortController();
+      trkManualRegAbort = ctrl;
+
+      try {
+        if (trkActiveStage === 'unassigned') {
+          RegDateCache.clearEmpty();
+          const targets = getUnassignedStudents(trkSelectedBranch).filter(s => !StudentStore.getKnownRegDate(s));
+          if (targets.length === 0) {
+            setTrkStatus('✓ Alle sichtbaren nicht zugeordneten Schüler haben bereits ein Anmeldedatum.', 'ok', false);
+            return;
+          }
+
+          let idx = 0, done = 0, found = 0;
+          setTrkStatus(`📅 Lade Kartei-Anmeldedaten (${done}/${targets.length})...`, 'info', true);
+
+          async function worker() {
+            while (idx < targets.length && !ctrl.signal.aborted && !uiSignal.aborted) {
+              const s = targets[idx++];
+              try {
+                const k = await StudentStore.fetchKartei(s.id, true);
+                const iso = extractRegistrationDate(k);
+                if (iso) {
+                  found++;
+                  s._regDate = iso;
+                  patchUnassignedRowRegDate(s.id, iso);
+                }
+              } catch (e) {}
+              done++;
+              if (!ctrl.signal.aborted) {
+                setTrkStatus(`📅 Lade Kartei-Anmeldedaten (${done}/${targets.length} · ${found} gefunden)...`, 'info', true);
+              }
+            }
+          }
+          await Promise.all(Array.from({ length: 4 }, () => worker()));
+          setTrkStatus(
+            ctrl.signal.aborted
+              ? `Abgebrochen (${found} Anmeldedaten geladen).`
+              : `✓ Fertig! ${found} von ${targets.length} Anmeldedaten aus der FSM-Kartei geladen.`,
+            'ok',
+            false
+          );
+          renderTrackingSuite();
+        } else {
+          // Für getrackte Einträge ohne Anmeldedatum: Kartei lesen & ins Google Sheet nachpflegen
+          const targets = TrackingManager.getAll().filter(e =>
+            e.stage === trkActiveStage &&
+            matchesTrkBranch(e.branch || extractBranchCode(e.karteiNr)) &&
+            !e.registrationDate
+          );
+
+          if (targets.length === 0) {
+            setTrkStatus('✓ Alle Einträge in diesem Bereich haben bereits ein Anmeldedatum.', 'ok', false);
+            return;
+          }
+
+          let done = 0, updated = 0;
+          setTrkStatus(`📅 Ziehe fehlende Anmeldedaten aus FSM-Karteien (${done}/${targets.length})...`, 'info', true);
+
+          for (const entry of targets) {
+            if (ctrl.signal.aborted || uiSignal.aborted) break;
+            try {
+              const k = await StudentStore.fetchKartei(entry.studentId);
+              const iso = extractRegistrationDate(k);
+              if (iso) {
+                await TrackingManager.save(entry, { registrationDate: iso });
+                updated++;
+              }
+            } catch (e) {}
+            done++;
+            setTrkStatus(`📅 Ziehe fehlende Anmeldedaten (${done}/${targets.length} · ${updated} ergänzt)...`, 'info', true);
+          }
+
+          setTrkStatus(
+            ctrl.signal.aborted
+              ? `Abgebrochen (${updated} Anmeldedaten ergänzt).`
+              : `✓ Fertig! ${updated} fehlende Anmeldedaten aus der Kartei ergänzt & im Google Sheet gespeichert.`,
+            'ok',
+            false
+          );
+        }
+      } finally {
+        trkManualRegAbort = null;
+        btn.disabled = false;
+      }
+    };
+
+    // Button "📦 Archiv abgleichen"
+    document.getElementById('btnTrkReconcile').onclick = async () => {
+      const btn = document.getElementById('btnTrkReconcile');
+      btn.disabled = true;
+      setTrkStatus('📦 Gleiche Tracking-Liste mit aktivem FSM-Bestand ab...', 'info', false);
+      try {
+        const activeList = await StudentStore.refresh(true, false);
+        TrackingManager.lastArchiveReconcile = 0;
+        const changed = await TrackingManager.reconcileArchivedWithActiveList(activeList);
+        setTrkStatus(
+          changed > 0
+            ? `✓ Archiv-Abgleich fertig: ${changed} Schüler-Status aktualisiert.`
+            : '✓ Archiv-Abgleich fertig: Alle Status sind bereits aktuell.',
+          'ok',
+          false
+        );
+        renderTrackingSuite();
+      } catch (err) {
+        setTrkStatus(`⚠️ Archiv-Abgleich fehlgeschlagen: ${err.message}`, 'err', false);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // Button "↻ Sheet-Sync"
+    document.getElementById('btnTrkSync').onclick = async () => {
+      const btn = document.getElementById('btnTrkSync');
+      btn.disabled = true;
+      setTrkStatus('↻ Synchronisiere mit Google Sheets & Fahrschulmanager...', 'info', false);
+      try {
+        await Promise.all([
+          TrackingManager.syncAll(true),
+          loadStudentsFromServer(true)
+        ]);
+        setTrkStatus('✓ Synchronisation abgeschlossen.', 'ok', false);
+        renderTrackingSuite();
+      } catch (err) {
+        setTrkStatus(`⚠️ Sync-Fehler: ${err.message}`, 'err', false);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // Schnell-Zuweisung (Suche + Dropdown + Auto-Anmeldedatum)
+    async function updateTrkAssignHits() {
+      const q = trkAssignSearch.value.trim();
+      trkQuickSelectedStudent = null;
+      btnTrkQuickAssign.disabled = true;
+
+      if (!q) {
+        trkAssignDropdown.classList.remove('open');
+        return;
+      }
+
+      if (StudentStore.list.length === 0) {
+        await StudentStore.refresh(true);
+      }
+
+      let hits = StudentStore.search(q, { wordStart: true, limit: 15 });
+      if (hits.length === 0) hits = StudentStore.search(q, { wordStart: false, limit: 15 });
+
+      if (hits.length === 0) {
+        trkAssignDropdown.innerHTML = `<div style="padding:10px; color:var(--err-text); font-size:12px;">Kein Schüler im FSM gefunden.</div>`;
+        trkAssignDropdown.classList.add('open');
+        return;
+      }
+
+      trkAssignDropdown.innerHTML = hits.map((s, idx) => `
+        <div class="trk-assign-hit" data-hit-idx="${idx}">
+          <div>
+            <strong>${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}</strong>
+            ${TrackingManager.badgeHtml(s.id)}
+            <div style="font-size:11px; color:var(--text-muted);">Kartei: ${escapeHtml(s._karteiNr || '—')} · Klasse: ${escapeHtml(s._klassenStr || '—')}</div>
+          </div>
+          <span class="fsm-badge b-ext">${escapeHtml(s._branch || '—')}</span>
+        </div>
+      `).join('');
+      trkAssignDropdown.classList.add('open');
+
+      trkAssignDropdown.querySelectorAll('.trk-assign-hit').forEach(row => {
+        row.onclick = async () => {
+          const student = hits[Number(row.getAttribute('data-hit-idx'))];
+          if (!student) return;
+          trkQuickSelectedStudent = student;
+          trkAssignSearch.value = `${student._nachname}, ${student._vorname} (${student._karteiNr || '—'})`;
+          trkAssignDropdown.classList.remove('open');
+          btnTrkQuickAssign.disabled = false;
+
+          const existing = TrackingManager.get(student.id);
+          if (existing) {
+            trkAssignStage.value = existing.stage;
+            trkAssignRegDate.value = existing.registrationDate || StudentStore.getKnownRegDate(student) || '';
+            trkAssignNote.value = existing.notes || '';
+          } else {
+            trkAssignRegDate.value = StudentStore.getKnownRegDate(student) || '';
+            if (!trkAssignRegDate.value) {
+              try {
+                const k = await StudentStore.fetchKartei(student.id);
+                const iso = extractRegistrationDate(k);
+                if (iso && trkQuickSelectedStudent?.id === student.id && !trkAssignRegDate.value) {
+                  trkAssignRegDate.value = iso;
+                }
+              } catch (e) {}
+            }
+          }
+        };
+      });
+    }
+
+    trkAssignSearch.addEventListener('input', debounce(updateTrkAssignHits, 120));
+    trkAssignSearch.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') trkAssignDropdown.classList.remove('open');
+    });
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.trk-assign-search-wrap')) {
+        trkAssignDropdown.classList.remove('open');
+      }
+    }, { signal: uiSignal });
+
+    btnTrkQuickAssign.onclick = async () => {
+      if (!trkQuickSelectedStudent) return;
+      const student = trkQuickSelectedStudent;
+      const stage = trkAssignStage.value || 'new';
+      const orig = btnTrkQuickAssign.innerHTML;
+      btnTrkQuickAssign.disabled = true;
+      btnTrkQuickAssign.textContent = '⏳ Speichere...';
+
+      try {
+        let regDate = trkAssignRegDate.value || StudentStore.getKnownRegDate(student);
+        if (!regDate) {
+          try {
+            const k = await StudentStore.fetchKartei(student.id);
+            regDate = extractRegistrationDate(k);
+          } catch (e) {}
+        }
+        const saved = await TrackingManager.save(student, {
+          stage,
+          registrationDate: regDate,
+          notes: trkAssignNote.value.trim(),
+          isArchived: student._isActive === false
+        });
+        const stageLabel = TrackingManager.STAGES[stage].label;
+        const jumpToTarget = () => {
+          trkActiveStage = stage;
+          if (trkSelectedBranch !== 'ALL' && saved.branch && saved.branch !== trkSelectedBranch) {
+            trkSelectedBranch = saved.branch;
+            TrackingManager.setSelectedBranch(trkSelectedBranch);
+          }
+          renderTrackingSuite();
+        };
+        if (saved?.outdatedBackend) {
+          setTrkStatus(
+            `⚠️ ${student._nachname}, ${student._vorname} → lokal in „${stageLabel}“ gespeichert. Google Sheet nutzt noch die alte Script-Version (bitte neue Version bereitstellen oder ⚙️ Sheet-URL anpassen)!`,
+            'err',
+            false,
+            { label: `→ Zu „${stageLabel}“`, onClick: jumpToTarget }
+          );
+        } else {
+          setTrkStatus(
+            `✓ ${student._nachname}, ${student._vorname} in „${stageLabel}“ gespeichert.`,
+            'ok',
+            false,
+            { label: `→ Zu „${stageLabel}“`, onClick: jumpToTarget }
+          );
+        }
+        trkAssignSearch.value = '';
+        trkAssignRegDate.value = '';
+        trkAssignNote.value = '';
+        trkQuickSelectedStudent = null;
+      } catch (err) {
+        setTrkStatus(`⚠️ Fehler beim Zuweisen: ${err.message}`, 'err', false);
+        btnTrkQuickAssign.disabled = false;
+      } finally {
+        btnTrkQuickAssign.innerHTML = orig;
+        btnTrkQuickAssign.disabled = !trkQuickSelectedStudent;
+      }
+    };
+
+    // Tracking Edit Modal Logik
+    let trkDeleteArmed = false;
+    let trkDeleteArmTimer = null;
+
+    function refreshTrkEditModalVisibility() {
+      const st = trkEditStage.value;
+      trkEditStopDriveWrap.style.display = (st === 'driving' || st === 'stopped') ? 'flex' : 'none';
+      trkEditStopProcWrap.style.display = (st === 'stopped') ? 'flex' : 'none';
+      if (st === 'stopped' && !trkEditStopProc.value) {
+        trkEditStopProc.value = getTodayIso();
+      }
+      const exp = checkRegistrationExpiry(trkEditRegDate.value);
+      if (exp.isExpired) {
+        trkEditExpAlert.style.display = 'block';
+        trkEditExpAlert.textContent = `⚠️ ${exp.label} — Vertrag ist über 2 Jahre alt (rot markiert)!`;
+      } else {
+        trkEditExpAlert.style.display = 'none';
+      }
+    }
+
+    function openTrkEditModal(entry) {
+      trkEditTarget = entry;
+      trkDeleteArmed = false;
+      clearTimeout(trkDeleteArmTimer);
+      btnTrkModalDelete.textContent = '🗑️ Aus Tracking entfernen';
+
+      trkModalTitle.textContent = `${entry.name || 'Schüler'} bearbeiten`;
+      trkModalSub.textContent = `Kartei-Nr.: ${entry.karteiNr || '—'} · Filiale: ${entry.branch || '—'} · Klasse: ${entry.klassen || '—'}`;
+      trkEditStage.value = entry.stage || 'new';
+      trkEditArchived.checked = Boolean(entry.isArchived);
+      trkEditRegDate.value = entry.registrationDate || StudentStore.getKnownRegDate(entry.studentId) || '';
+      trkEditStopDrive.value = entry.stoppedDrivingDate || '';
+      trkEditStopProc.value = entry.processStoppedDate || '';
+      trkEditNotes.value = entry.notes || '';
+      trkEditStatus.textContent = entry.updatedAt
+        ? `Zuletzt geändert: ${entry.updatedBy || 'Büro'} · ${entry.updatedAt}`
+        : '';
+      trkEditStatus.style.color = 'var(--text-secondary)';
+
+      refreshTrkEditModalVisibility();
+      trkEditModal.classList.add('open');
+
+      // Falls noch kein Anmeldedatum vorhanden, automatisch im Hintergrund aus Kartei vorschlagen
+      if (!trkEditRegDate.value && entry.studentId) {
+        const targetSid = entry.studentId;
+        StudentStore.fetchKartei(targetSid).then(k => {
+          const iso = extractRegistrationDate(k);
+          if (iso && trkEditTarget?.studentId === targetSid && !trkEditRegDate.value) {
+            trkEditRegDate.value = iso;
+            refreshTrkEditModalVisibility();
+            trkEditStatus.textContent = `✓ Anmeldedatum (${formatGermanDate(iso)}) automatisch aus Kartei geladen — zum Übernehmen speichern.`;
+            trkEditStatus.style.color = '#0067B8';
+          }
+        }).catch(() => {});
+      }
+    }
+
+    function closeTrkEditModal() {
+      trkEditModal.classList.remove('open');
+      trkEditTarget = null;
+    }
+
+    trkEditStage.onchange = refreshTrkEditModalVisibility;
+    trkEditRegDate.onchange = refreshTrkEditModalVisibility;
+    document.getElementById('btnTrkModalX').onclick = closeTrkEditModal;
+    document.getElementById('btnTrkModalCancel').onclick = closeTrkEditModal;
+    trkEditModal.onclick = (e) => { if (e.target === trkEditModal) closeTrkEditModal(); };
+
+    btnTrkPullKarteiDate.onclick = async () => {
+      if (!trkEditTarget?.studentId) return;
+      btnTrkPullKarteiDate.disabled = true;
+      trkEditStatus.textContent = 'Lade Anmeldedatum aus FSM-Kartei...';
+      trkEditStatus.style.color = '#0067B8';
+      try {
+        const k = await StudentStore.fetchKartei(trkEditTarget.studentId, true);
+        const iso = extractRegistrationDate(k);
+        if (iso) {
+          trkEditRegDate.value = iso;
+          refreshTrkEditModalVisibility();
+          trkEditStatus.textContent = `✓ Anmeldedatum aus Kartei übernommen: ${formatGermanDate(iso)}`;
+          trkEditStatus.style.color = '#166534';
+        } else {
+          trkEditStatus.textContent = '⚠️ Kein Anmeldedatum in der FSM-Kartei gefunden.';
+          trkEditStatus.style.color = '#b45309';
+        }
+      } catch (err) {
+        trkEditStatus.textContent = `⚠️ Kartei-Fehler: ${err.message}`;
+        trkEditStatus.style.color = '#b3261e';
+      } finally {
+        btnTrkPullKarteiDate.disabled = false;
+      }
+    };
+
+    btnTrkPullLastDrive.onclick = async () => {
+      if (!trkEditTarget?.studentId) return;
+      btnTrkPullLastDrive.disabled = true;
+      trkEditStatus.textContent = 'Suche letzte Fahrstunde im FSM...';
+      trkEditStatus.style.color = '#0067B8';
+      try {
+        const praxis = await fetchPraxisOnly(trkEditTarget.studentId, uiSignal);
+        const dated = (praxis?.items || []).filter(it => it.isoDate).sort((a, b) => b.sortTs - a.sortTs);
+        if (dated.length > 0) {
+          trkEditStopDrive.value = dated[0].isoDate;
+          trkEditStatus.textContent = `✓ Letzte Fahrstunde gefunden: ${dated[0].datum} (${dated[0].art})`;
+          trkEditStatus.style.color = '#166534';
+        } else {
+          trkEditStatus.textContent = '⚠️ Keine Fahrstunden im FSM gefunden.';
+          trkEditStatus.style.color = '#b45309';
+        }
+      } catch (err) {
+        trkEditStatus.textContent = `⚠️ Fahrstunden-Fehler: ${err.message}`;
+        trkEditStatus.style.color = '#b3261e';
+      } finally {
+        btnTrkPullLastDrive.disabled = false;
+      }
+    };
+
+    btnTrkModalSave.onclick = async () => {
+      if (!trkEditTarget) return;
+      btnTrkModalSave.disabled = true;
+      const orig = btnTrkModalSave.textContent;
+      btnTrkModalSave.textContent = '⏳ Speichere...';
+      trkEditStatus.textContent = 'Speichere im Google Sheet...';
+      trkEditStatus.style.color = '#0067B8';
+
+      try {
+        await TrackingManager.save(trkEditTarget, {
+          stage: trkEditStage.value,
+          registrationDate: trkEditRegDate.value,
+          stoppedDrivingDate: trkEditStopDrive.value,
+          processStoppedDate: trkEditStopProc.value,
+          notes: trkEditNotes.value,
+          isArchived: trkEditArchived.checked
+        });
+        closeTrkEditModal();
+        setTrkStatus('✓ Tracking-Änderungen im Google Sheet gespeichert.', 'ok', false);
+      } catch (err) {
+        trkEditStatus.textContent = `⚠️ Fehler: ${err.message}`;
+        trkEditStatus.style.color = '#b3261e';
+      } finally {
+        btnTrkModalSave.disabled = false;
+        btnTrkModalSave.textContent = orig;
+      }
+    };
+
+    btnTrkModalDelete.onclick = async () => {
+      if (!trkEditTarget) return;
+      if (!trkDeleteArmed) {
+        trkDeleteArmed = true;
+        btnTrkModalDelete.textContent = 'Wirklich entfernen? (Nochmal klicken)';
+        clearTimeout(trkDeleteArmTimer);
+        trkDeleteArmTimer = setTimeout(() => {
+          trkDeleteArmed = false;
+          btnTrkModalDelete.textContent = '🗑️ Aus Tracking entfernen';
+        }, 3500);
+        return;
+      }
+
+      trkDeleteArmed = false;
+      clearTimeout(trkDeleteArmTimer);
+      btnTrkModalDelete.disabled = true;
+      try {
+        const name = trkEditTarget.name;
+        await TrackingManager.remove(trkEditTarget.studentId);
+        closeTrkEditModal();
+        setTrkStatus(`✓ ${name} wurde aus dem Tracking entfernt (steht wieder in „Nicht zugeordnet“).`, 'ok', false);
+      } catch (err) {
+        trkEditStatus.textContent = `⚠️ Fehler beim Entfernen: ${err.message}`;
+        trkEditStatus.style.color = '#b3261e';
+      } finally {
+        btnTrkModalDelete.disabled = false;
+      }
+    };
+
+    // --------------------------------------------------------------------------
+    // 12. STUDENT LIST FILTERING, COMBINED INSPECTION, BATCH & BOOT
+    // --------------------------------------------------------------------------
     let fallbackCheckDoneForQuery = '';
 
     async function inspectStudentObject(s, targetTab = null, skipWorkerRequirement = false) {
       if (!s || !s.id) return;
-      if (targetTab !== 'dokumente' && !skipWorkerRequirement && !requireWorkerName()) return;
+      if (targetTab !== 'dokumente' && targetTab !== 'tracking' && !skipWorkerRequirement && !requireWorkerName()) return;
 
       const sid = String(s.id);
       const tr = document.getElementById(`row-${sid}`);
@@ -5023,6 +7461,7 @@
       const classQuery = (document.getElementById('qKlasse').value || '').toLowerCase().trim();
 
       visibleStudents = allStudents.filter(s => {
+        if (selectedTopBranch !== 'ALL' && s._branch !== selectedTopBranch) return false;
         if (selectedLetter && !s._nachname.toLowerCase().startsWith(selectedLetter)) return false;
         if (classQuery && !s._klassenLower.includes(classQuery)) return false;
         for (const tok of queryTokens) {
@@ -5072,7 +7511,7 @@
 
         tr.innerHTML = `
           <td>${escapeHtml(s._karteiNr || '—')}</td>
-          <td class="student-name-cell" style="font-weight:500;">${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}${NotesManager.badgeHtml(sid)}</td>
+          <td class="student-name-cell" style="font-weight:500;">${escapeHtml(s._nachname)}, ${escapeHtml(s._vorname)}${NotesManager.badgeHtml(sid)}${TrackingManager.badgeHtml(sid)}</td>
           <td>${escapeHtml(s._klassenStr || '—')}</td>
           <td class="verdict-theory-cell">${theoryHtml}</td>
           <td class="verdict-praxis-cell">${praxisHtml}</td>
@@ -5080,7 +7519,7 @@
             <div style="display:inline-flex; gap:4px; align-items:center;">
               <button type="button" class="btn btn-petrol btn-sm btn-inspect" title="Theorie & Pflichtfahrten prüfen">Prüfen</button>
               <button type="button" class="btn btn-outline btn-sm btn-praxis" title="Direkt zur Pflichtfahrten-Analyse">Praxis</button>
-              <button type="button" class="btn btn-outline btn-sm btn-kartei" title="Karteikarte & Büro-Notiz anzeigen">Kartei</button>
+              <button type="button" class="btn btn-outline btn-sm btn-kartei" title="Karteikarte, Büro-Notiz & Tracking anzeigen">Kartei</button>
             </div>
           </td>
         `;
@@ -5103,30 +7542,46 @@
 
       document.getElementById('btnBatch').disabled = visibleStudents.length === 0;
       const statusEl = document.getElementById('status');
-      statusEl.style.color = 'var(--text-secondary)';
-      const syncTime = StudentStore.lastFetch
-        ? new Date(StudentStore.lastFetch).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
-        : '—';
-      statusEl.textContent = `Summe angezeigter Fahrschüler: ${visibleStudents.length} (von ${allStudents.length} · Stand: ${syncTime} Uhr)`;
+      if (StudentStore.lastError && allStudents.length === 0) {
+        statusEl.style.color = 'var(--err-solid)';
+        statusEl.textContent = `⚠️ Verbindungsfehler zum Fahrschulmanager (${StudentStore.lastError}) — Bitte „↻ Sync“ klicken.`;
+      } else {
+        statusEl.style.color = 'var(--text-secondary)';
+        const syncTime = StudentStore.lastFetch
+          ? new Date(StudentStore.lastFetch).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+          : '—';
+        statusEl.textContent = `Summe angezeigter Fahrschüler: ${visibleStudents.length} (von ${allStudents.length} · Stand: ${syncTime} Uhr)`;
+      }
     }
 
     async function loadStudentsFromServer(force = false) {
       const status = document.getElementById('status');
+      status.style.color = 'var(--text-secondary)';
       status.textContent = 'Synchronisiere Fahrschüler...';
       const incInactive = document.getElementById('qActive').value === 'false';
 
-      // Google-Sheet-Notizen im Hintergrund synchronisieren (blockiert nicht das Laden der Schülerliste)
+      // Google-Sheet-Notizen & Tracking im Hintergrund synchronisieren
       NotesManager.syncAll(force).then((changed) => {
+        populateTopBranchSelect();
         if (changed && visibleStudents.length > 0) applyFilters(false);
+        if (document.getElementById('modTracking').style.display !== 'none') renderTrackingSuite();
       });
 
       allStudents = await StudentStore.refresh(force, incInactive);
+      populateTopBranchSelect();
       await applyFilters(true);
+      if (document.getElementById('modTracking').style.display !== 'none') {
+        renderTrackingSuite();
+      }
     }
 
     appStoreListener = (updatedList) => {
       allStudents = updatedList;
+      populateTopBranchSelect();
       applyFilters(false);
+      if (document.getElementById('modTracking').style.display !== 'none') {
+        renderTrackingSuite();
+      }
     };
     StudentStore.listeners.add(appStoreListener);
 
@@ -5144,6 +7599,8 @@
       document.getElementById('qText').value = '';
       document.getElementById('qKlasse').value = '';
       selectedLetter = '';
+      selectedTopBranch = 'ALL';
+      qBranchSelect.value = 'ALL';
       fallbackCheckDoneForQuery = '';
       alphabetBar.querySelectorAll('.char-btn').forEach((el, idx) => el.classList.toggle('selected', idx === 0));
       applyFilters(true);
@@ -5198,13 +7655,33 @@
       }
     };
 
+    // Erst NACH vollständiger Initialisierung aller Tabs & Variablen starten
+    if (initialMod) switchActiveModule(initialMod);
+
     loadStudentsFromServer(true).then(() => {
       if (initialStudentId) {
         const target = allStudents.find(s => s.id === initialStudentId);
         if (target) {
-          document.getElementById('qText').value = target._karteiNr || `${target._nachname} ${target._vorname}`;
-          applyFilters(true);
-          inspectStudentObject(target, initialMod || null, true);
+          if (initialMod === 'tracking') {
+            const existing = TrackingManager.get(target.id);
+            if (existing) {
+              trkActiveStage = existing.stage;
+              trkSelectedBranch = existing.branch || 'ALL';
+              TrackingManager.setSelectedBranch(trkSelectedBranch);
+              renderTrackingSuite();
+              openTrkEditModal(existing);
+            } else {
+              trkActiveStage = 'unassigned';
+              trkSelectedBranch = target._branch || 'ALL';
+              TrackingManager.setSelectedBranch(trkSelectedBranch);
+              trkSearchInput.value = target._karteiNr || target._nachname;
+              renderTrackingSuite();
+            }
+          } else {
+            document.getElementById('qText').value = target._karteiNr || `${target._nachname} ${target._vorname}`;
+            applyFilters(true);
+            inspectStudentObject(target, initialMod || null, true);
+          }
         }
       }
     });
